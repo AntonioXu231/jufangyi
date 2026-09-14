@@ -1,0 +1,45 @@
+# Local assistant metadata and archives
+.learnings/
+.workbuddy/
+*.rar
+*.zip
+
+# Vivado generated working files
+.Xil/
+*.log
+*.jou
+*.str
+*.wdf
+*.wpc
+*.pb
+*.dcp
+*.rpx
+*.wdb
+*.hwdef
+*.vds
+*.vdi
+*.rpt
+*.rptx
+*.html
+*.xml
+*.cache/
+*.runs/
+*.sim/
+*.ip_user_files/
+*.hw/
+*.gen/
+
+# Implementation and synthesis working directories below Vivado projects
+**/.Xil/
+**/*.cache/
+**/*.runs/
+**/*.sim/
+**/*.ip_user_files/
+**/*.hw/
+**/*.gen/
+
+# Simulation outputs
+*.csv
+xsim.dir/
+webtalk*.xml
+usage_statistics_webtalk.*
