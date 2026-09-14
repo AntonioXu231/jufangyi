@@ -30,11 +30,7 @@ module pd_feature_bd_wrapper
     FIXED_IO_mio,
     FIXED_IO_ps_clk,
     FIXED_IO_ps_porb,
-    FIXED_IO_ps_srstb,
-    adc_clk_0,
-    adc_data_0,
-    adc_dv_0,
-    sync_in_0);
+    FIXED_IO_ps_srstb);
   inout [14:0]DDR_addr;
   inout [2:0]DDR_ba;
   inout DDR_cas_n;
@@ -56,10 +52,6 @@ module pd_feature_bd_wrapper
   inout FIXED_IO_ps_clk;
   inout FIXED_IO_ps_porb;
   inout FIXED_IO_ps_srstb;
-  input adc_clk_0;
-  input [47:0]adc_data_0;
-  input [3:0]adc_dv_0;
-  input sync_in_0;
 
   wire [14:0]DDR_addr;
   wire [2:0]DDR_ba;
@@ -82,10 +74,6 @@ module pd_feature_bd_wrapper
   wire FIXED_IO_ps_clk;
   wire FIXED_IO_ps_porb;
   wire FIXED_IO_ps_srstb;
-  wire adc_clk_0;
-  wire [47:0]adc_data_0;
-  wire [3:0]adc_dv_0;
-  wire sync_in_0;
 
   pd_feature_bd pd_feature_bd_i
        (.DDR_addr(DDR_addr),
@@ -108,9 +96,5 @@ module pd_feature_bd_wrapper
         .FIXED_IO_mio(FIXED_IO_mio),
         .FIXED_IO_ps_clk(FIXED_IO_ps_clk),
         .FIXED_IO_ps_porb(FIXED_IO_ps_porb),
-        .FIXED_IO_ps_srstb(FIXED_IO_ps_srstb),
-        .adc_clk_0(adc_clk_0),
-        .adc_data_0(adc_data_0),
-        .adc_dv_0(adc_dv_0),
-        .sync_in_0(sync_in_0));
+        .FIXED_IO_ps_srstb(FIXED_IO_ps_srstb));
 endmodule
