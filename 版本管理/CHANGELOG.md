@@ -8,6 +8,20 @@
 
 - 暂无。
 
+## [v1.2.0] - 2026-09-16
+
+### IIR 陷波滤波集成与控制路径时序收敛
+
+- 在新快照 `pd_feature_bd_2020_2_dds_onboard_iir_20260916` 中保存四通道、每通道 2 个带通 + 6 个陷波二阶 IIR 的实现；缺省为全局旁路和四通道旁路，保持既有 DDS → DDR → 特征提取 → DMA 数据行为。
+- 新增 `pd_filter_0` AXI4-Lite 从设备（`0x4002_0000`），在 `pd_ddr_0` 与 `pd_feature_0` 之间接入滤波链；控制路径采用独立 AW/W 握手、WSTRB 写掩码和系数流水寄存器。
+- 在特征提取控制口前加入官方 AXI Register Slice，消除控制读返回关键路径，使最终实现时序收敛。
+
+### 验证状态
+
+- 行为仿真：Vivado 2020.2 下 `tb_pd_filter_chain` 输出 `TB_PD_FILTER_CHAIN_PASS`；覆盖默认旁路、独立 AW/W 次序、读回与 WSTRB。
+- OOC 综合：IIR 滤波核在 130 MHz 约束下 WNS `+0.976 ns`、TNS `0.000 ns`，使用 64 DSP。
+- 全工程实现：后布局物理优化报告 WNS `0.000 ns`、TNS `0.000 ns`、WHS `+0.017 ns`、THS `0.000 ns`；该版本尚未重新生成 bitstream、导出新 XSA 或完成滤波上板回归。
+
 ## [v1.1.0] - 2026-09-15
 
 ### 板内 DDS、ILA 与变长 DMA 包接收验证

@@ -438,6 +438,196 @@ no timer:
 - Every packet must contain exactly one `type=0x01` word and it must be the **last**
   word. `lastnotcyc` and `multicyc` must both stay 0; anything else falsifies the model.
 
+### Parser fix (2026-09-15): peak-event field map was wrong
+
+While cross-checking the probe against the RTL defines, a real defect surfaced in the
+**field decode**, not in the transport logic.
+
+| Source | Peak-event layout |
+|---|---|
+| `接口契约v3.0.md` §7 | `phase[39:28] polarity[27] ch_id[26:25] event_seq[24:0]` |
+| `pd_defines.vh:36` | `` `define PD_PH_FIELD_W 12 `` ("与 B 侧 RTL 一致 … 已定案 2026-09-08") |
+| `pd_feature_core.v:574` | comment: peak `ch_id` at `[26:25]`, cycle `ch_id` at `[31:30]` |
+| `dma_s2mm_dds_test.c` | **10-bit map**: `(lo>>29)&1`, `(lo>>27)&3`, `lo&0x07ffffff` |
+
+The contract and the RTL agree on the 12-bit map; **only the C parser disagreed**, so
+every `phase` / `pol` / `ch` / `seq` it printed was wrong by two bits. The probes
+(`dma_s2mm_probe.c`, `dma_s2mm_probe_v2.c`) inherited the same defect.
+
+Both probes are now fixed, and the field map is a single macro block
+(`PD_PH_FIELD_W`) that mirrors `pd_defines.vh`, so it can only drift in one place.
+
+**Verification** — the six peak words captured in the run log were re-decoded with an
+independent implementation (Python) and then asserted against the C macros on a host
+build; all six match:
+
+```text
+PD_PH_FIELD_W=12  HISHIFT=4 LOSHIFT=28 LOMASK=0xf POL=27 CH=25 SEQ=0x1ffffff
+  raw=00FD2C18_02000024  phase= 384 pol=0 ch=1 seq=36   expect  384 0 1 36  OK
+  raw=00002A04_BC00004B  phase=  75 pol=1 ch=2 seq=75   expect   75 1 2 75  OK
+  raw=00FD2F08_00000024  phase= 128 pol=0 ch=0 seq=36   expect  128 0 0 36  OK
+  raw=00002A04_CC00004C  phase=  76 pol=1 ch=2 seq=76   expect   76 1 2 76  OK
+  raw=00FD1438_06000024  phase= 896 pol=0 ch=3 seq=36   expect  896 0 3 36  OK
+  raw=00002A04_DC00004D  phase=  77 pol=1 ch=2 seq=77   expect   77 1 2 77  OK
+RESULT: all 6 OK
+```
+
+Independent corroboration that the fix is right: under the corrected map the three
+`00002A04_*` words decode as **channel 2 with consecutive `seq` 75, 76, 77** — exactly
+what a per-channel event counter must do. The buggy map returned `ch = 3, 1, 3` for
+the same three words, because bits `[26:25]` were being counted inside the sequence
+field instead of being read as the channel.
+
+Note the length histogram is unaffected by this: lengths come from `S2MM_LENGTH`, not
+from the field decode. The cycle-statistics word layout is also unaffected — it is
+fixed at `cycle_idx[55:32] ch_id[31:30] cyc_n[29:16] qmax[15:0]`.
+
+### v3: bounded run, and the 2026-09-15 target-state incident
+
+`sw/dma_s2mm_probe_v3.c` is v2 plus one bound: after `PKT_LIMIT` (20000) packets it
+prints the final report and parks the CPU in `WFI` with the S2MM channel no longer
+armed. The measurement is otherwise identical, so results stay comparable.
+
+Why this was needed. v2 re-arms with no inter-transfer gap and polls `DMASR` flat out,
+so once Vitis releases the CPU (`con`) the target is left running at full load. On
+2026-09-15 that produced this, all from the **same build**:
+
+```text
+11:45:06  dow F:/ps/pd_dma_s2mm_test/build/pd_dma_s2mm_test.elf
+11:45:07  con                                   -> v2 ran, serial output observed   OK
+11:45:23  same ELF, rst -processor
+11:45:25  ERROR Memory write error at 0x100000. AP transaction timeout
+11:45:34+ every retry -> ERROR AP transaction error, DAP status 0xF0000021
+```
+
+The identical binary downloaded and ran seventeen seconds earlier. **The binary was not
+the variable — the state left on the target was.** Two consequences worth remembering:
+
+1. Everything from the second attempt onward is a **sticky-error echo** of that single
+   failed bus transaction. Reading the retries (all `0xF0000021`) tells you nothing; only
+   the first error line does.
+2. `APB Memory access port is disabled` in the target list is a *CoreSight stopped
+   reason*, not a failure by itself. In this incident it was the label attached to the
+   failure, and it is the same text that shows up for an unresponsive slave.
+
+Recovery that worked in principle and should be the standing procedure:
+
+1. **Power-cycle the board** — clears the stuck DDR controller, the latched DAP error and
+   the PL configuration in one step. Nothing else is meaningful until this is done.
+2. **Program the PL bit** (Vivado Hardware Manager, or `fpga <bit>` in xsct). The Vitis run
+   configuration has `programDevice: false`, so it does *not* do this for you.
+3. Then download and run.
+
+Operational rule, more important than any code change here:
+
+> **Always halt the target (or power-cycle) before re-downloading, and never press Run a
+> second time against a board that is still executing the previous probe.** From the
+> debugger's side a continuously running instrument is indistinguishable from a board
+> that will not respond.
+
+Also noted in `pd_dma_s2mm_test/_ide/.theia/launch.json`: `programDevice: false`,
+`resetSystem: false`, and **both** `usingFSBL: true` and `usingPs7Init: true` enabled
+simultaneously. AMD guidance is that FSBL already runs `ps7_init`, so only one of the two
+should be active.
+
+## Result of the v2 discriminating run (2026-09-15) — the length is RATE-driven
+
+Final report of the bounded run (`dma_s2mm_probe`, 11009 packets):
+
+```text
+packets=11009 min=8 max=8232(max@651) avg=1834
+hist(bytes<= 8:8058 16:106 32:41 64:251 128:1 256:4 512:4 1024:7
+     2048:41 4096:69 8192:44 16384:2383 32768:0 65528:0 over=0 zero=0
+acct: peak=2514014 cyc=11009 cycN=2512958 other=0 lastnotcyc=0 multicyc=0
+acct: cycles=2779 pktsPerCycle_x100=396 evtsPerCycle=904
+acct: polls_min=1 polls_max=79945 maxPktPolls=79801
+```
+
+### The question this was built to answer, answered
+
+The pre-registered criterion was: *if the peak words received equal `sum(n)` of the cycle
+packets, explanation (A) holds and the length is rate-driven.*
+
+```text
+peak = 2514014      cycN = 2512958      difference = 1056  =  0.042 %
+```
+
+**They match to within 0.04 %.** The big packets are one power cycle of real peak
+events. The length is therefore **rate-driven**, and the 1024-versus-1025 resemblance to
+the four-channel FIFO capacity is a coincidence.
+
+Independent second confirmation is in the same report: `polls_min = 1` but
+`maxPktPolls = 79801`. A saturated-FIFO drain would complete in tens of polls (1024 beats
+at one beat per 130 MHz cycle is about 8 us). 79801 polls is roughly one power cycle of
+waiting, which is what a real frame interval looks like and a backlog drain does not.
+
+### The stream model is confirmed exactly, not approximately
+
+Three structural checks, all self-reported by the probe, all clean:
+
+| Counter | Value | Meaning |
+|---|---|---|
+| `other` | **0** | no word carried an unknown type byte |
+| `lastnotcyc` | **0** | every packet's last word is a `type=0x01` cycle packet |
+| `multicyc` | **0** | every packet contains exactly one cycle word |
+
+So "the TLAST beat is always the cycle packet, and it always terminates the packet" is
+confirmed against real traffic. `cyc = 11009 = packets` follows from `multicyc = 0`.
+
+### New defect found in the RTL while explaining the residual
+
+`pd_feature_core.v:199`, `:211`, `:344-346`:
+
+```verilog
+reg  win_pending, cyc_pending;                                   // a FLAG, not a counter
+wire fsm_take_cyc = (fsm == S_IDLE) && !win_pending && cyc_pending;
+if (cyc_end)            cyc_pending <= 1'b1;
+else if (fsm_take_cyc)  cyc_pending <= 1'b0;
+```
+
+A cycle boundary that arrives while `cyc_pending` is still set is **swallowed**. The
+measurement agrees: `pktsPerCycle_x100 = 396`, i.e. 3.96 cycle packets per boundary where
+the design permits 4. About **1 % of channel-cycle slots never emit their cycle packet**;
+their events roll into the next cycle's `n` (which is why `peak == cycN` still holds).
+
+Two consequences, both contract-relevant:
+
+1. `cycle_idx` is incremented only inside `S_CYC`, so a swallowed boundary does not
+   increment it either. **The PS cannot detect the lost frame from the event stream** —
+   it sees a normal `cycle_idx` step carrying roughly twice the usual `n`.
+2. The skip rate will rise under heavier load. This is a latent scaling defect for
+   the 65 MSPS target, not a current failure.
+
+Contract §7 does not describe this behaviour at all. Together with the missing
+packet-length bound, that is **two** gaps in the same section.
+
+### Engineering verdict
+
+Observed maximum packet: 8232 bytes (1029 beats) against `BTT = 65528`, i.e. **8.0x**
+headroom — and between the two runs the maximum moved from 8224 to 8232 bytes, i.e. it
+tracks the discharge activity. So:
+
+- `BTT = 65528` is a valid **bring-up** configuration.
+- It is **not** a structural guarantee, and it is capped by `c_sg_length_width = 16`
+  at 65535 bytes. **Production must use option B (PL fixed-length framing)**, or must
+  carry a verified worst-case event-rate budget with a documented margin.
+
+### One number still does not add up
+
+`evtsPerCycle = 904` while the big packets average about 1026 peak words
+(2383 packets in the `(8192,16384]` bucket, max 8232 bytes, i.e. a tight 1025..1029 beat
+cluster). A packet bounded by two adjacent boundaries should carry about one cycle of
+events, not 1.13 cycles' worth. Conservation is not violated — the big packets carry
+97.4 % of all peak words over 97.4 % of the time — so the discrepancy is in the
+**events-per-cycle denominator**, not in the totals. Two candidates remain:
+`cycle_idx` advancing at a slightly different rate than the sync (so `cycles` is not
+exactly the number of elapsed power cycles), or boundary-to-boundary windows that are not
+exactly one cycle.
+
+It is recorded here rather than explained away. The measurement that settles it is to log,
+per packet, the `cycle_idx` of the terminating cycle word: that gives the number of
+`cycle_idx` units each packet actually spans, instead of inferring it from totals.
+
 ### Verdict
 
 The receive path is **functionally correct at BTT = 65528 with the present stimulus**:
