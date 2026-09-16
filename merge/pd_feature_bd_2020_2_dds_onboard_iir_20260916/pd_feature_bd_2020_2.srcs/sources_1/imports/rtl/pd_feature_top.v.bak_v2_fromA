@@ -1,0 +1,341 @@
+// =============================================================================
+// pd_feature_top.v  --  多通道局部放电特征提取 IP 顶层
+// -----------------------------------------------------------------------------
+// 数据流:
+//   ADC(4ch x 12bit @20MSPS)
+//     -> pd_feature_core  分段峰值提取 / 1024 相位窗 / n,I,P,Q 统计 / PRPD 写
+//     -> pd_axis_fifo     突发平滑
+//     -> pd_axis_arb      帧级轮询仲裁
+//     -> M_AXIS           8 字节事件包 (供 AXI DMA 搬至 DDR)
+//   AXI4-Lite -> pd_axil_regs -> 各通道配置; 状态/累加值回读; PRPD 图谱读取
+//
+// =============================================================================
+// 【重要】时钟域说明
+//   本版本为单时钟设计: S_AXI_ACLK / clk / 事件流共用同一个 PL 时钟(典型
+//   100MHz), ADC 侧以 adc_dv 脉冲表示 20MSPS 样本有效。
+//   接入真实 ADS805E 时, 其输出随 20MHz 采样时钟变化, 与本模块时钟异步。
+//   此时需在 ADC 前端为每个通道插入一级异步 FIFO(xpm_fifo_async 或
+//   FIFO Generator, 深度 >= 64, 独立读写时钟), 读侧用本时钟产生 adc_dv。
+//   同步输入 sync_in 在本模块内已做两级同步器。
+// =============================================================================
+`timescale 1ns / 1ps
+`include "pd_defines.vh"
+
+module pd_feature_top #(
+    parameter integer NUM_CH               = 4,
+    parameter integer ADC_W                = `PD_ADC_W,
+    parameter integer PH_W                 = `PD_PH_W,
+    parameter integer TS_W                 = `PD_TS_W,
+    parameter integer EV_W                 = `PD_EV_W,
+    parameter integer FIFO_AW              = 8,          // 每通道事件 FIFO 深度 = 256
+    parameter integer C_S_AXI_DATA_WIDTH   = 32,
+    parameter integer C_S_AXI_ADDR_WIDTH   = 16
+)(
+    // ================= 时钟 / 复位 =================
+    input  wire                            clk,
+    input  wire                            rst_n,
+
+    // ================= ADC 接口 (每通道独立 ADS805E) =================
+    input  wire [NUM_CH*ADC_W-1:0]         adc_data,     // offset binary
+    input  wire [NUM_CH-1:0]               adc_dv,       // 样本有效脉冲 (20MSPS)
+
+    // ================= 同步输入 =================
+    input  wire                            sync_in,      // 50~400Hz 整形后方波
+
+    // ================= AXI4-Lite Slave =================
+    input  wire [C_S_AXI_ADDR_WIDTH-1:0]   s_axi_awaddr,
+    input  wire [2:0]                      s_axi_awprot,
+    input  wire                            s_axi_awvalid,
+    output wire                            s_axi_awready,
+    input  wire [C_S_AXI_DATA_WIDTH-1:0]   s_axi_wdata,
+    input  wire [3:0]                      s_axi_wstrb,
+    input  wire                            s_axi_wvalid,
+    output wire                            s_axi_wready,
+    output wire [1:0]                      s_axi_bresp,
+    output wire                            s_axi_bvalid,
+    input  wire                            s_axi_bready,
+    input  wire [C_S_AXI_ADDR_WIDTH-1:0]   s_axi_araddr,
+    input  wire [2:0]                      s_axi_arprot,
+    input  wire                            s_axi_arvalid,
+    output wire                            s_axi_arready,
+    output wire [C_S_AXI_DATA_WIDTH-1:0]   s_axi_rdata,
+    output wire [1:0]                      s_axi_rresp,
+    output wire                            s_axi_rvalid,
+    input  wire                            s_axi_rready,
+
+    // ================= 事件输出 (AXI-Stream Master) =================
+    output wire [EV_W-1:0]                 m_axis_tdata,
+    output wire                            m_axis_tvalid,
+    output wire                            m_axis_tlast,
+    input  wire                            m_axis_tready,
+
+    output wire                            irq
+);
+
+    // =========================================================================
+    // 内部连线
+    // =========================================================================
+    wire [NUM_CH-1:0]        w_enable, w_sw_rst, w_prpd_clear;
+    wire [NUM_CH-1:0]        w_auto_clear, w_ev_all, w_prpd_max;
+    wire [2*NUM_CH-1:0]      w_mode;
+    wire [32*NUM_CH-1:0]     w_phase_win, w_phase_inc, w_thresh, w_scale;
+    wire [32*NUM_CH-1:0]     w_upeak, w_deadtime, w_meas_cycles;
+    // ---- v2: 剔除区域配置 ----
+    wire [4*NUM_CH-1:0]      w_reg0_cfg, w_reg1_cfg;
+    wire [24*NUM_CH-1:0]     w_reg0_phase, w_reg1_phase;
+    wire [32*NUM_CH-1:0]     w_reg0_q, w_reg1_q;
+
+    wire [NUM_CH-1:0]        w_sync_locked, w_meas_done, w_overflow;
+    wire [32*NUM_CH-1:0]     w_sync_period, w_n, w_qmax, w_live_cycles;
+    wire [64*NUM_CH-1:0]     w_sum_abs_q, w_sum_qu;
+
+    wire [PH_W-1:0]          w_prpd_ps_addr;
+    wire [16*NUM_CH-1:0]     w_prpd_ps_rdata;
+
+    wire [31:0]              w_gctrl, w_girq_en;
+    wire [31:0]              w_fifo_count;
+    wire [63:0]              w_event_count;
+
+    // core -> fifo
+    wire [NUM_CH*EV_W-1:0]   c_tdata;
+    wire [NUM_CH-1:0]        c_tvalid, c_tlast, c_tready;
+    // fifo -> arb
+    wire [NUM_CH*EV_W-1:0]   f_tdata;
+    wire [NUM_CH-1:0]        f_tvalid, f_tlast, f_tready;
+    wire [NUM_CH*(FIFO_AW+1)-1:0] f_count;
+    wire [NUM_CH-1:0]        f_ovf;
+
+    wire [NUM_CH-1:0]        core_rst_n;
+
+    // =========================================================================
+    // 复位: 全局复位 | 全局软复位 | 每通道软复位脉冲
+    // 注意: rst_n 是 1bit, 必须显式复制成 NUM_CH 位, 否则 Verilog 会按零扩展
+    //       导致只有 bit0 有效(其余通道被永久复位) —— 这是一个容易踩的坑。
+    // =========================================================================
+    assign core_rst_n = {(NUM_CH){rst_n}} &
+                        {(NUM_CH){~w_gctrl[1]}} &
+                        ~w_sw_rst;
+
+    // =========================================================================
+    // 寄存器文件
+    // =========================================================================
+    pd_axil_regs #(
+        .C_S_AXI_DATA_WIDTH (C_S_AXI_DATA_WIDTH),
+        .C_S_AXI_ADDR_WIDTH (C_S_AXI_ADDR_WIDTH),
+        .NUM_CH             (NUM_CH),
+        .PH_W               (PH_W)
+    ) u_regs (
+        .S_AXI_ACLK     (clk),
+        .S_AXI_ARESETN  (rst_n),
+        .S_AXI_AWADDR   (s_axi_awaddr),
+        .S_AXI_AWVALID  (s_axi_awvalid),
+        .S_AXI_AWREADY  (s_axi_awready),
+        .S_AXI_WDATA    (s_axi_wdata),
+        .S_AXI_WSTRB    (s_axi_wstrb),
+        .S_AXI_WVALID   (s_axi_wvalid),
+        .S_AXI_WREADY   (s_axi_wready),
+        .S_AXI_BRESP    (s_axi_bresp),
+        .S_AXI_BVALID   (s_axi_bvalid),
+        .S_AXI_BREADY   (s_axi_bready),
+        .S_AXI_ARADDR   (s_axi_araddr),
+        .S_AXI_ARVALID  (s_axi_arvalid),
+        .S_AXI_ARREADY  (s_axi_arready),
+        .S_AXI_RDATA    (s_axi_rdata),
+        .S_AXI_RRESP    (s_axi_rresp),
+        .S_AXI_RVALID   (s_axi_rvalid),
+        .S_AXI_RREADY   (s_axi_rready),
+
+        .o_enable       (w_enable),
+        .o_sw_rst       (w_sw_rst),
+        .o_prpd_clear   (w_prpd_clear),
+        .o_mode         (w_mode),
+        .o_phase_win    (w_phase_win),
+        .o_phase_inc    (w_phase_inc),
+        .o_thresh       (w_thresh),
+        .o_scale        (w_scale),
+        .o_upeak        (w_upeak),
+        .o_deadtime     (w_deadtime),
+        .o_meas_cycles  (w_meas_cycles),
+        .o_auto_clear   (w_auto_clear),
+        .o_ev_all       (w_ev_all),
+        .o_prpd_max     (w_prpd_max),
+
+        .o_reg0_cfg     (w_reg0_cfg),
+        .o_reg0_phase   (w_reg0_phase),
+        .o_reg0_q       (w_reg0_q),
+        .o_reg1_cfg     (w_reg1_cfg),
+        .o_reg1_phase   (w_reg1_phase),
+        .o_reg1_q       (w_reg1_q),
+
+        .i_sync_locked  (w_sync_locked),
+        .i_meas_done    (w_meas_done),
+        .i_overflow     (w_overflow),
+        .i_sync_period  (w_sync_period),
+        .i_n            (w_n),
+        .i_qmax         (w_qmax),
+        .i_sum_abs_q    (w_sum_abs_q),
+        .i_sum_qu       (w_sum_qu),
+        .i_live_cycles  (w_live_cycles),
+
+        .prpd_ps_addr   (w_prpd_ps_addr),
+        .prpd_ps_rdata  (w_prpd_ps_rdata),
+
+        .o_gctrl        (w_gctrl),
+        .o_girq_en      (w_girq_en),
+        .i_fifo_count   (w_fifo_count),
+        .i_event_count  (w_event_count),
+
+        .irq            (irq)
+    );
+
+    // =========================================================================
+    // 每通道: core + PRPD RAM + 事件 FIFO
+    // =========================================================================
+    genvar i;
+    generate
+        for (i = 0; i < NUM_CH; i = i + 1) begin : GEN_CH
+
+            // core 与 PRPD RAM 之间的本地互联
+            wire [PH_W-1:0]   prpd_addr_l;
+            wire [15:0]       prpd_wdata_l;
+            wire              prpd_we_l;
+            wire [15:0]       prpd_rdata_l;
+            wire              prpd_clr_busy_l;
+
+            // ---- 特征提取核心 ----
+            pd_feature_core #(
+                .CH_ID    (i),
+                .ADC_W    (ADC_W),
+                .PH_W     (PH_W),
+                .TS_W     (TS_W),
+                .EV_W     (EV_W)
+            ) u_core (
+                .clk             (clk),
+                .rst_n           (core_rst_n[i]),
+
+                .adc_data        (adc_data[i*ADC_W +: ADC_W]),
+                .adc_dv          (adc_dv[i]),
+                .sync_in         (sync_in),
+
+                .cfg_enable      (w_enable[i]),
+                .cfg_mode        (w_mode[2*i +: 2]),
+                .cfg_phase_win   (w_phase_win[32*i +: PH_W]),
+                .cfg_phase_inc   (w_phase_inc[32*i +: 32]),
+                .cfg_thresh      (w_thresh[32*i +: 16]),
+                .cfg_scale       (w_scale[32*i +: 16]),
+                .cfg_upeak       (w_upeak[32*i +: 16]),
+                .cfg_deadtime    (w_deadtime[32*i +: 16]),
+                .cfg_meas_cycles (w_meas_cycles[32*i +: 16]),
+                .cfg_auto_clear  (w_auto_clear[i]),
+                .cfg_ev_all      (w_ev_all[i]),
+                .cfg_prpd_max    (w_prpd_max[i]),
+
+                .cfg_reg0_cfg    (w_reg0_cfg[4*i +: 4]),
+                .cfg_reg0_phase  (w_reg0_phase[24*i +: 24]),
+                .cfg_reg0_q      (w_reg0_q[32*i +: 32]),
+                .cfg_reg1_cfg    (w_reg1_cfg[4*i +: 4]),
+                .cfg_reg1_phase  (w_reg1_phase[24*i +: 24]),
+                .cfg_reg1_q      (w_reg1_q[32*i +: 32]),
+
+                .ev_tdata        (c_tdata[i*EV_W +: EV_W]),
+                .ev_tvalid       (c_tvalid[i]),
+                .ev_tlast        (c_tlast[i]),
+                .ev_tready       (c_tready[i]),
+
+                .prpd_addr       (prpd_addr_l),
+                .prpd_wdata      (prpd_wdata_l),
+                .prpd_we         (prpd_we_l),
+                .prpd_rdata      (prpd_rdata_l),
+
+                .st_sync_period  (w_sync_period[32*i +: 32]),
+                .st_sync_locked  (w_sync_locked[i]),
+                .st_sn_n         (w_n[32*i +: 32]),
+                .st_sn_qmax      (w_qmax[32*i +: 32]),
+                .st_sn_sum_abs_q (w_sum_abs_q[64*i +: 64]),
+                .st_sn_sum_qu    (w_sum_qu[64*i +: 64]),
+                .st_live_cycles  (w_live_cycles[32*i +: 32]),
+                .st_meas_done    (w_meas_done[i]),
+                .st_overflow     (w_overflow[i])
+            );
+
+            // ---- PRPD 图谱 RAM ----
+            pd_prpd_ram #(
+                .PH_W   (PH_W),
+                .DEPTH  (1024),
+                .DATA_W (16)
+            ) u_prpd (
+                .clk         (clk),
+                .rst_n       (core_rst_n[i]),
+                .pl_addr     (prpd_addr_l),
+                .pl_rdata    (prpd_rdata_l),
+                .pl_wdata    (prpd_wdata_l),
+                .pl_we       (prpd_we_l),
+                .ps_addr     (w_prpd_ps_addr),
+                .ps_rdata    (w_prpd_ps_rdata[16*i +: 16]),
+                .clear_req   (w_prpd_clear[i]),
+                .clear_busy  (prpd_clr_busy_l)
+            );
+
+            // ---- 事件 FIFO ----
+            pd_axis_fifo #(
+                .DATA_W (EV_W),
+                .ADDR_W (FIFO_AW)
+            ) u_fifo (
+                .clk      (clk),
+                .rst_n    (core_rst_n[i]),
+                .s_tdata  (c_tdata[i*EV_W +: EV_W]),
+                .s_tvalid (c_tvalid[i]),
+                .s_tlast  (c_tlast[i]),
+                .s_tready (c_tready[i]),
+                .m_tdata  (f_tdata[i*EV_W +: EV_W]),
+                .m_tvalid (f_tvalid[i]),
+                .m_tlast  (f_tlast[i]),
+                .m_tready (f_tready[i]),
+                .count    (f_count[i*(FIFO_AW+1) +: (FIFO_AW+1)]),
+                .overflow ()
+            );
+        end
+    endgenerate
+
+    // =========================================================================
+    // 仲裁 + 输出
+    // =========================================================================
+    pd_axis_arb #(
+        .NUM_CH (NUM_CH),
+        .DATA_W (EV_W),
+        .CH_W   (2)
+    ) u_arb (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .s_tdata  (f_tdata),
+        .s_tvalid (f_tvalid),
+        .s_tlast  (f_tlast),
+        .s_tready (f_tready),
+        .m_tdata  (m_axis_tdata),
+        .m_tvalid (m_axis_tvalid),
+        .m_tlast  (m_axis_tlast),
+        .m_tready (m_axis_tready)
+    );
+
+    // ---- FIFO 占用深度求和 ----
+    reg [31:0] fifo_sum;
+    integer j;
+    always @* begin
+        fifo_sum = 32'd0;
+        for (j = 0; j < NUM_CH; j = j + 1)
+            fifo_sum = fifo_sum + {{(31-FIFO_AW){1'b0}},
+                                   f_count[j*(FIFO_AW+1) +: (FIFO_AW+1)]};
+    end
+    assign w_fifo_count = fifo_sum;
+
+    // ---- 已输出事件总数 ----
+    reg [63:0] ev_cnt;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            ev_cnt <= 64'd0;
+        else if (m_axis_tvalid && m_axis_tready)
+            ev_cnt <= ev_cnt + 64'd1;
+    end
+    assign w_event_count = ev_cnt;
+
+endmodule
