@@ -8,6 +8,22 @@
 
 - 暂无。
 
+## [v1.4.0] - 2026-09-16
+
+### DDR 四槽自动快照管理
+
+- 在 `pd_feature_bd_2020_2_dds_onboard_iir_ddr1g_20260916` 工程中加入 `pd_ddr_slot_mgr`：为冻结后的环形 DDR 数据分配四个 12 MiB 快照槽，并执行 `FREE -> RESERVED -> COPYING -> VALID -> LOCKED -> FREE` 生命周期。
+- 保持既有 `pd_ddr_snap_copy` 与单个 `dm_cp` DataMover 实例；自动快照与原有手动 `SNAP_START` 共用同一复制引擎，且手动启动优先。
+- 扩展 `pd_ddr_axil` 的自动快照使能、槽锁定/释放、状态、序号、丢弃计数及每槽描述符寄存器；不改变既有 AXI4-Lite 地址与旧手动快照语义。
+- 使用 24 字节对齐的槽基址 `0x2000_1000` 起始，避免 192-bit 数据块跨槽边界；移除槽管理器中的直接 `%24` 余数运算，改为复用平衡的 `pd_align24_check`，修复该控制路径的时序热点。
+
+### 验证状态
+
+- 行为仿真：Vivado 2020.2 下 `tb_pd_ddr_slot_mgr` 输出 `TB_PD_DDR_SLOT_MGR_PASS seq=5 drops=2`；覆盖槽分配、锁定/释放、满槽拒绝和超长请求拒绝。
+- 综合、实现：全工程后布局物理优化报告 WNS `+0.007 ns`、TNS `0.000 ns`、WHS `+0.036 ns`、THS `0.000 ns`。
+- 自动快照控制面端到端仿真、bitstream、XSA、PS 驱动和上板回归：未执行；不得据此版本声明上述项目已经验证。
+- 仍存在 Clock Wizard 输入端与 PS FCLK 的重复 primary-clock 方法学告警，已定位，尚未在本版本处理。
+
 ## [v1.3.0] - 2026-09-16
 
 ### PS DDR 1 GB 可寻址映射备份

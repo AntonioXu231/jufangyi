@@ -183,6 +183,16 @@ module pd_ddr_wr_top #(
     wire [31:0]          freeze_base, freeze_len;
     wire                 copy_busy, copy_done, copy_err;
     wire [31:0]          copy_chunk_cnt, copy_bytes_done;
+    wire                 auto_snap_en;
+    wire [3:0]           slot_lock_cmd, slot_release_cmd;
+    wire                 slot_status_clear;
+    wire [3:0]           slot_valid, slot_busy, slot_locked;
+    wire                 slot_full, slot_cfg_err, slot_cmd_err;
+    wire                 slot_req_overflow, slot_req_pending;
+    wire [1:0]           slot_last;
+    wire [31:0]          slot_snapshot_seq, slot_drop_count;
+    wire [31:0]          slot0_len, slot1_len, slot2_len, slot3_len;
+    wire [31:0]          slot0_seq, slot1_seq, slot2_seq, slot3_seq;
 
     // =========================================================================
     // 1) 复位处理
@@ -493,21 +503,46 @@ module pd_ddr_wr_top #(
     // 9) 快照拷贝控制：freeze_done 后必须等 DataMover 写尾部全部完成。
     //    否则 MM2S 可能先于最后一条 S2MM 写读到旧数据。
     // =========================================================================
-    reg freeze_done_d, auto_copy_pending;
-    wire auto_copy_launch;
+    reg freeze_done_d;
+    reg legacy_auto_copy_pending;
+    reg slot_freeze_req;
+    reg slot_req_overflow_pulse;
+    wire legacy_auto_copy_launch;
     wire manual_copy_launch;
+    wire slot_copy_start;
+    wire [AXI_ADDR_W-1:0] slot_copy_src_addr, slot_copy_dst_addr;
+    wire [31:0] slot_copy_len;
+    wire slot_req_ack, slot_req_drop;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             freeze_done_d    <= 1'b0;
-            auto_copy_pending <= 1'b0;
+            legacy_auto_copy_pending <= 1'b0;
+            slot_freeze_req <= 1'b0;
+            slot_req_overflow_pulse <= 1'b0;
         end else begin
             freeze_done_d <= freeze_done;
-            if (~freeze_done_d & freeze_done)
-                auto_copy_pending <= 1'b1;
-            else if (freeze_resume)
-                auto_copy_pending <= 1'b0;
-            else if (auto_copy_launch)
-                auto_copy_pending <= 1'b0;
+            slot_req_overflow_pulse <= 1'b0;
+            if (freeze_resume) begin
+                legacy_auto_copy_pending <= 1'b0;
+                slot_freeze_req <= 1'b0;
+            end else begin
+                if (~freeze_done_d & freeze_done) begin
+                    if (auto_snap_en) begin
+                        if (slot_freeze_req)
+                            slot_req_overflow_pulse <= 1'b1;
+                        else
+                            slot_freeze_req <= 1'b1;
+                    end else begin
+                        legacy_auto_copy_pending <= 1'b1;
+                    end
+                end
+                if (!auto_snap_en)
+                    slot_freeze_req <= 1'b0;
+                if (legacy_auto_copy_launch)
+                    legacy_auto_copy_pending <= 1'b0;
+                if (slot_req_ack || slot_req_drop)
+                    slot_freeze_req <= 1'b0;
+            end
         end
     end
     wire snap_len_err = (freeze_len > snap_size);
@@ -530,14 +565,61 @@ module pd_ddr_wr_top #(
         (.value(freeze_len),  .aligned(freeze_len_align24));
     wire snap_align_err = !snap_base_align24 || !snap_size_align24 ||
                           !freeze_base_align24 || !freeze_len_align24;
-    wire snapshot_cfg_err = snap_len_err || snap_addr_err || snap_align_err;
-    // 自动请求允许排队等待当前拷贝结束；只有真正发出 start 才清 pending。
-    // 手动调试启动同样必须等环写尾命令落地，且必须已有冻结描述符。
-    assign auto_copy_launch = auto_copy_pending && ring_write_idle &&
-                              !copy_busy && !snapshot_cfg_err;
+    wire legacy_snapshot_cfg_err = snap_len_err || snap_addr_err || snap_align_err;
+    // Legacy automatic capture is retained when slot automatic mode is disabled.
+    // A manual o_snap_start remains available in either mode and gets priority.
+    assign legacy_auto_copy_launch = !auto_snap_en && legacy_auto_copy_pending &&
+                                     ring_write_idle && !copy_busy &&
+                                     !legacy_snapshot_cfg_err;
     assign manual_copy_launch = snap_start && freeze_done && ring_write_idle &&
-                                !copy_busy && !snapshot_cfg_err;
-    wire copy_start = auto_copy_launch | manual_copy_launch;
+                                !copy_busy && !legacy_snapshot_cfg_err;
+    wire snapshot_cfg_err = auto_snap_en ? slot_cfg_err : legacy_snapshot_cfg_err;
+    wire copy_start = legacy_auto_copy_launch | manual_copy_launch | slot_copy_start;
+    wire [AXI_ADDR_W-1:0] copy_src_addr = slot_copy_start ? slot_copy_src_addr : freeze_base;
+    wire [AXI_ADDR_W-1:0] copy_dst_addr = slot_copy_start ? slot_copy_dst_addr : snap_base;
+    wire [31:0] copy_len = slot_copy_start ? slot_copy_len : freeze_len;
+
+    pd_ddr_slot_mgr #(
+        .AXI_ADDR_W (AXI_ADDR_W)
+    ) u_slot_mgr (
+        .clk                 (clk),
+        .rst_n               (ddr_rst_n),
+        .i_freeze_req        (slot_freeze_req),
+        .i_cancel_req        (freeze_resume),
+        .i_freeze_base       (freeze_base),
+        .i_freeze_len        (freeze_len),
+        .i_auto_snap_en      (auto_snap_en),
+        .i_ring_write_idle   (ring_write_idle),
+        .i_copy_busy         (copy_busy),
+        .i_copy_done         (copy_done),
+        .i_copy_err          (copy_err),
+        .i_manual_copy_launch(manual_copy_launch),
+        .i_slot_lock         (slot_lock_cmd),
+        .i_slot_release      (slot_release_cmd),
+        .i_req_overflow      (slot_req_overflow_pulse),
+        .i_status_clear      (slot_status_clear),
+        .o_req_ack           (slot_req_ack),
+        .o_req_drop          (slot_req_drop),
+        .o_copy_start        (slot_copy_start),
+        .o_copy_src_addr     (slot_copy_src_addr),
+        .o_copy_dst_addr     (slot_copy_dst_addr),
+        .o_copy_len          (slot_copy_len),
+        .o_slot_valid        (slot_valid),
+        .o_slot_busy         (slot_busy),
+        .o_slot_locked       (slot_locked),
+        .o_slot_full         (slot_full),
+        .o_cfg_err           (slot_cfg_err),
+        .o_cmd_err           (slot_cmd_err),
+        .o_req_overflow      (slot_req_overflow),
+        .o_req_pending       (slot_req_pending),
+        .o_last_slot         (slot_last),
+        .o_snapshot_seq      (slot_snapshot_seq),
+        .o_drop_count        (slot_drop_count),
+        .o_slot0_len         (slot0_len), .o_slot1_len(slot1_len),
+        .o_slot2_len         (slot2_len), .o_slot3_len(slot3_len),
+        .o_slot0_seq         (slot0_seq), .o_slot1_seq(slot1_seq),
+        .o_slot2_seq         (slot2_seq), .o_slot3_seq(slot3_seq)
+    );
 
     pd_ddr_snap_copy #(
         .AXI_ADDR_W  (AXI_ADDR_W),
@@ -547,9 +629,9 @@ module pd_ddr_wr_top #(
         .rst_n           (ddr_rst_n),
         .i_clear         (freeze_resume),
         .i_start         (copy_start),
-        .i_src_addr      (freeze_base),
-        .i_dst_addr      (snap_base),
-        .i_len_bytes     (freeze_len),
+        .i_src_addr      (copy_src_addr),
+        .i_dst_addr      (copy_dst_addr),
+        .i_len_bytes     (copy_len),
         .i_ring_base     (`DDR_RING_BASE),
         .i_ring_size     (`DDR_RING_SIZE),
         .o_busy          (copy_busy),
@@ -606,10 +688,14 @@ module pd_ddr_wr_top #(
         .o_freeze_trig  (freeze_trig),
         .o_freeze_resume(freeze_resume),
         .o_snap_start   (snap_start),
+        .o_auto_snap_en (auto_snap_en),
+        .o_slot_lock    (slot_lock_cmd),
+        .o_slot_release (slot_release_cmd),
+        .o_slot_status_clear(slot_status_clear),
         .i_copy_busy    (copy_busy),
         .i_copy_done    (copy_done),
         .i_copy_err     (copy_err),
-        .i_copy_pending (auto_copy_pending),
+        .i_copy_pending (auto_snap_en ? slot_req_pending : legacy_auto_copy_pending),
         .i_snapshot_cfg_err(snapshot_cfg_err),
         .i_hiwm         (hiwm),
         .i_freeze_done  (freeze_done),
@@ -623,7 +709,22 @@ module pd_ddr_wr_top #(
         .i_freeze_base  (freeze_base),
         .i_freeze_len   (freeze_len),
         .i_copy_chunk_cnt(copy_chunk_cnt),
-        .i_copy_bytes_done(copy_bytes_done)
+        .i_copy_bytes_done(copy_bytes_done),
+        .i_slot_valid   (slot_valid),
+        .i_slot_busy    (slot_busy),
+        .i_slot_locked  (slot_locked),
+        .i_slot_full    (slot_full),
+        .i_slot_cfg_err (slot_cfg_err),
+        .i_slot_cmd_err (slot_cmd_err),
+        .i_slot_req_overflow(slot_req_overflow),
+        .i_slot_req_pending(slot_req_pending),
+        .i_slot_last    (slot_last),
+        .i_slot_snapshot_seq(slot_snapshot_seq),
+        .i_slot_drop_count(slot_drop_count),
+        .i_slot0_len    (slot0_len), .i_slot1_len(slot1_len),
+        .i_slot2_len    (slot2_len), .i_slot3_len(slot3_len),
+        .i_slot0_seq    (slot0_seq), .i_slot1_seq(slot1_seq),
+        .i_slot2_seq    (slot2_seq), .i_slot3_seq(slot3_seq)
     );
 
     // =========================================================================
