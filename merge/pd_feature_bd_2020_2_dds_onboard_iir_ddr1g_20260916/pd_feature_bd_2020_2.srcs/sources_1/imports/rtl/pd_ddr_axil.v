@@ -31,6 +31,15 @@
 //   0x40 SNAP_CHUNKS    RO  已完成的拷贝分片数
 //   0x44 SNAP_BYTES     RO  本次已完成的拷贝字节数
 //   0x48 SNAP_SEQ       RO  成功快照序号（每次 copy_done +1）
+//   0x4C SLOT_CTRL      RW  [0]auto_snap_en [7:4]lock(W1P)
+//                          [11:8]release(W1P) [12]status_clear(W1P)
+//   0x50 SLOT_STATUS    RO  [3:0]valid [7:4]busy [11:8]locked [12]full
+//                          [13]cfg_err [14]req_overflow [15]cmd_err
+//                          [16]pending [18:17]last_slot
+//   0x54 SLOT_SEQ       RO  自动快照成功序号
+//   0x58 SLOT_DROPS     RO  自动请求拒绝/溢出累计数
+//   0x5C RESERVED       RO  固定读回 0
+//   0x60..0x9C          RO  四槽描述符：BASE / LEN / SEQ / FLAGS
 // =============================================================================
 `include "pd_ddr_defines.vh"
 
@@ -69,6 +78,10 @@ module pd_ddr_axil #(
     output reg             o_freeze_trig,
     output reg             o_freeze_resume,
     output reg             o_snap_start,      // 调试用：手动触发一次拷贝
+    output reg             o_auto_snap_en,
+    output reg  [3:0]      o_slot_lock,
+    output reg  [3:0]      o_slot_release,
+    output reg             o_slot_status_clear,
 
     input  wire            i_copy_busy,
     input  wire            i_copy_done,
@@ -87,7 +100,26 @@ module pd_ddr_axil #(
     input  wire [31:0]     i_freeze_base,
     input  wire [31:0]     i_freeze_len,
     input  wire [31:0]     i_copy_chunk_cnt,
-    input  wire [31:0]     i_copy_bytes_done
+    input  wire [31:0]     i_copy_bytes_done,
+    input  wire [3:0]      i_slot_valid,
+    input  wire [3:0]      i_slot_busy,
+    input  wire [3:0]      i_slot_locked,
+    input  wire            i_slot_full,
+    input  wire            i_slot_cfg_err,
+    input  wire            i_slot_cmd_err,
+    input  wire            i_slot_req_overflow,
+    input  wire            i_slot_req_pending,
+    input  wire [1:0]      i_slot_last,
+    input  wire [31:0]     i_slot_snapshot_seq,
+    input  wire [31:0]     i_slot_drop_count,
+    input  wire [31:0]     i_slot0_len,
+    input  wire [31:0]     i_slot1_len,
+    input  wire [31:0]     i_slot2_len,
+    input  wire [31:0]     i_slot3_len,
+    input  wire [31:0]     i_slot0_seq,
+    input  wire [31:0]     i_slot1_seq,
+    input  wire [31:0]     i_slot2_seq,
+    input  wire [31:0]     i_slot3_seq
 );
 
     localparam [11:0] A_CTRL      = 12'h00;
@@ -109,6 +141,27 @@ module pd_ddr_axil #(
     localparam [11:0] A_SNAP_CHUNK= 12'h40;
     localparam [11:0] A_SNAP_BYTES= 12'h44;
     localparam [11:0] A_SNAP_SEQ  = 12'h48;
+    localparam [11:0] A_SLOT_CTRL = 12'h4C;
+    localparam [11:0] A_SLOT_STATUS=12'h50;
+    localparam [11:0] A_SLOT_SEQ  = 12'h54;
+    localparam [11:0] A_SLOT_DROPS= 12'h58;
+    localparam [11:0] A_SLOT_RSVD = 12'h5C;
+    localparam [11:0] A_SLOT0_BASE= 12'h60;
+    localparam [11:0] A_SLOT0_LEN = 12'h64;
+    localparam [11:0] A_SLOT0_SEQ = 12'h68;
+    localparam [11:0] A_SLOT0_FLAGS=12'h6C;
+    localparam [11:0] A_SLOT1_BASE= 12'h70;
+    localparam [11:0] A_SLOT1_LEN = 12'h74;
+    localparam [11:0] A_SLOT1_SEQ = 12'h78;
+    localparam [11:0] A_SLOT1_FLAGS=12'h7C;
+    localparam [11:0] A_SLOT2_BASE= 12'h80;
+    localparam [11:0] A_SLOT2_LEN = 12'h84;
+    localparam [11:0] A_SLOT2_SEQ = 12'h88;
+    localparam [11:0] A_SLOT2_FLAGS=12'h8C;
+    localparam [11:0] A_SLOT3_BASE= 12'h90;
+    localparam [11:0] A_SLOT3_LEN = 12'h94;
+    localparam [11:0] A_SLOT3_SEQ = 12'h98;
+    localparam [11:0] A_SLOT3_FLAGS=12'h9C;
 
     // ---------------- 写通道：AW/W 同时收，再回 B ----------------
     reg [11:0] waddr;
@@ -171,11 +224,18 @@ module pd_ddr_axil #(
             o_freeze_resume <= 1'b0;
             o_snap_start    <= 1'b0;
             o_sw_rst        <= 1'b0;
+            o_auto_snap_en  <= 1'b0;
+            o_slot_lock     <= 4'b0;
+            o_slot_release  <= 4'b0;
+            o_slot_status_clear <= 1'b0;
         end else begin
             o_freeze_trig   <= 1'b0;   // 脉冲型，默认撤销
             o_freeze_resume <= 1'b0;
             o_snap_start    <= 1'b0;
             o_sw_rst        <= 1'b0;
+            o_slot_lock     <= 4'b0;
+            o_slot_release  <= 4'b0;
+            o_slot_status_clear <= 1'b0;
             if (wr_fire) begin
                 case (waddr)
                     A_CTRL: begin
@@ -194,6 +254,18 @@ module pd_ddr_axil #(
                         if (wstrb[0] && wdata[1]) begin
                             o_freeze_resume <= 1'b1;
                         end
+                    end
+                    A_SLOT_CTRL: begin
+                        // AUTO_EN is an RW bit.  Command writes must not
+                        // accidentally clear it merely because bit0 is zero.
+                        // Combine mode changes and W1P commands only in
+                        // separate AXI-Lite writes.
+                        if (wstrb[0] && (wdata[7:4] == 4'b0) &&
+                            !(wstrb[1] && (|wdata[12:8])))
+                            o_auto_snap_en <= wdata[0];
+                        if (wstrb[0]) o_slot_lock <= wdata[7:4];
+                        if (wstrb[1]) o_slot_release <= wdata[11:8];
+                        if (wstrb[1] && wdata[12]) o_slot_status_clear <= 1'b1;
                     end
                     default: ;
                 endcase
@@ -243,7 +315,32 @@ module pd_ddr_axil #(
                     A_SNAP_CHUNK:s_axi_rdata <= i_copy_chunk_cnt;
                     A_SNAP_BYTES:s_axi_rdata <= i_copy_bytes_done;
                     A_SNAP_SEQ:  s_axi_rdata <= snap_seq;
-                    default:     s_axi_rdata <= 32'hDEAD_BEEF;
+                    A_SLOT_CTRL: s_axi_rdata <= {31'd0, o_auto_snap_en};
+                    A_SLOT_STATUS:s_axi_rdata <= {13'd0, i_slot_last,
+                                                   i_slot_req_pending, i_slot_cmd_err,
+                                                   i_slot_req_overflow, i_slot_cfg_err,
+                                                   i_slot_full, i_slot_locked,
+                                                   i_slot_busy, i_slot_valid};
+                    A_SLOT_SEQ: s_axi_rdata <= i_slot_snapshot_seq;
+                    A_SLOT_DROPS: s_axi_rdata <= i_slot_drop_count;
+                    A_SLOT_RSVD: s_axi_rdata <= 32'd0;
+                    A_SLOT0_BASE:s_axi_rdata <= `DDR_SLOT0_BASE;
+                    A_SLOT0_LEN:s_axi_rdata <= i_slot0_len;
+                    A_SLOT0_SEQ:s_axi_rdata <= i_slot0_seq;
+                    A_SLOT0_FLAGS:s_axi_rdata <= {29'd0, i_slot_locked[0], i_slot_busy[0], i_slot_valid[0]};
+                    A_SLOT1_BASE:s_axi_rdata <= `DDR_SLOT1_BASE;
+                    A_SLOT1_LEN:s_axi_rdata <= i_slot1_len;
+                    A_SLOT1_SEQ:s_axi_rdata <= i_slot1_seq;
+                    A_SLOT1_FLAGS:s_axi_rdata <= {29'd0, i_slot_locked[1], i_slot_busy[1], i_slot_valid[1]};
+                    A_SLOT2_BASE:s_axi_rdata <= `DDR_SLOT2_BASE;
+                    A_SLOT2_LEN:s_axi_rdata <= i_slot2_len;
+                    A_SLOT2_SEQ:s_axi_rdata <= i_slot2_seq;
+                    A_SLOT2_FLAGS:s_axi_rdata <= {29'd0, i_slot_locked[2], i_slot_busy[2], i_slot_valid[2]};
+                    A_SLOT3_BASE:s_axi_rdata <= `DDR_SLOT3_BASE;
+                    A_SLOT3_LEN:s_axi_rdata <= i_slot3_len;
+                    A_SLOT3_SEQ:s_axi_rdata <= i_slot3_seq;
+                    A_SLOT3_FLAGS:s_axi_rdata <= {29'd0, i_slot_locked[3], i_slot_busy[3], i_slot_valid[3]};
+                    default:     s_axi_rdata <= 32'd0;
                 endcase
             end else begin
                 s_axi_arready <= 1'b0;

@@ -3,7 +3,7 @@
 <!--                                                         -->
 <!-- Copyright 1986-2020 Xilinx, Inc. All Rights Reserved.   -->
 
-<Project Version="7" Minor="54" Path="F:/xinya/v5/merge/pd_feature_bd_2020_2_dds_onboard_20260914/pd_feature_bd_2020_2.xpr">
+<Project Version="7" Minor="54" Path="F:/xinya/v5/merge/pd_feature_bd_2020_2_dds_onboard_iir_ddr1g_20260916/pd_feature_bd_2020_2.xpr">
   <DefaultLaunch Dir="$PRUNDIR"/>
   <Configuration>
     <Option Name="Id" Val="85742a4489bc4dc699618d3b556fb8ab"/>
@@ -44,7 +44,7 @@
     <Option Name="IPUserFilesDir" Val="$PPRDIR/../pd_feature_bd_2020_2/pd_feature_bd_2020_2.ip_user_files"/>
     <Option Name="IPStaticSourceDir" Val="$PPRDIR/../pd_feature_bd_2020_2/pd_feature_bd_2020_2.ip_user_files/ipstatic"/>
     <Option Name="EnableBDX" Val="FALSE"/>
-    <Option Name="WTXSimLaunchSim" Val="16"/>
+    <Option Name="WTXSimLaunchSim" Val="17"/>
     <Option Name="WTModelSimLaunchSim" Val="0"/>
     <Option Name="WTQuestaLaunchSim" Val="0"/>
     <Option Name="WTIesLaunchSim" Val="0"/>
@@ -253,6 +253,13 @@
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
+      <File Path="$PSRCDIR/sources_1/new/pd_ddr_slot_mgr.v">
+        <FileInfo>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="implementation"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
       <File Path="$PSRCDIR/sources_1/imports/rtl/pd_ddr_snap_copy.v">
         <FileInfo>
           <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/rtl/pd_ddr_snap_copy.v"/>
@@ -348,6 +355,14 @@
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
+      <File Path="$PSRCDIR/sim_1/new/tb_pd_ddr_slot_mgr.v">
+        <FileInfo>
+          <Attr Name="AutoDisabled" Val="1"/>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="implementation"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
       <Config>
         <Option Name="DesignMode" Val="RTL"/>
         <Option Name="TopModule" Val="pd_feature_bd_wrapper"/>
@@ -377,6 +392,14 @@
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
+      <File Path="$PSRCDIR/sim_1/new/tb_pd_ddr_slot_mgr.v">
+        <FileInfo>
+          <Attr Name="AutoDisabled" Val="1"/>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="implementation"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
       <File Path="$PPRDIR/../pd_feature_bd_2020_2/tb_pd_feature_dds_behav2.wcfg">
         <FileInfo>
           <Attr Name="UsedIn" Val="simulation"/>
@@ -393,6 +416,7 @@
       <Config>
         <Option Name="DesignMode" Val="RTL"/>
         <Option Name="TopModule" Val="tb_pd_feature_dds"/>
+        <Option Name="TopLib" Val="xil_defaultlib"/>
         <Option Name="TransportPathDelay" Val="0"/>
         <Option Name="TransportIntDelay" Val="0"/>
         <Option Name="SelectedSimModel" Val="rtl"/>
