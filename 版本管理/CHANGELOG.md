@@ -8,6 +8,19 @@
 
 - 暂无。
 
+## [v1.3.0] - 2026-09-16
+
+### PS DDR 1 GB 可寻址映射备份
+
+- 新建完整工程快照 `pd_feature_bd_2020_2_dds_onboard_iir_ddr1g_20260916`，保留已有 DDS、ILA、IIR、`pd_ddr_0` 与 AXI DMA 内容。
+- 将 Zynq PS7 DDR 可见范围从 `0x0010_0000 - 0x1FFF_FFFF` 扩展为 `0x0010_0000 - 0x3FFF_FFFF`；DDR3 颗粒型号保持 `MT41K256M16 RE-125`，单颗颗粒位宽保持 16 Bit，PS 总线仍为 DQ=32、DQS=4。
+- 将 `pd_ddr_0` 的 HP0/HP1 三条恢复映射脚本由 512 MB 同步为 1 GB，防止后续恢复 BD 时缩回旧范围。
+
+### 验证状态
+
+- Block Design：已在 Vivado 2020.2 中保存，且 PS7 属性读回为 `PCW_DDR_RAM_BASEADDR=0x00100000`、`PCW_DDR_RAM_HIGHADDR=0x3FFFFFFF`；Address Editor 中 AXI DMA 与 `pd_ddr_0` 的 HP0/HP1 映射已手动调整为 1 GB。
+- 综合、实现、bitstream、XSA 和上板：本次地址映射变更后均未执行；不得将此前版本的时序或上板结果作为本版本验证结论。
+
 ## [v1.2.0] - 2026-09-16
 
 ### IIR 陷波滤波集成与控制路径时序收敛
