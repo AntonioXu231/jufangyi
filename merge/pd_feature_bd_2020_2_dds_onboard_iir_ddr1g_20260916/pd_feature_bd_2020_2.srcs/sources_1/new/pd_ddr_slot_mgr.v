@@ -27,6 +27,10 @@ module pd_ddr_slot_mgr #(
     output reg [`DDR_SLOT_NUM-1:0] o_slot_locked,
     output reg o_slot_full, output reg o_cfg_err, output reg o_cmd_err,
     output reg o_req_overflow, output wire o_req_pending,
+    // Sticky completion notification.  It is intentionally cleared only by
+    // the software W1P status-clear command, so a PS level interrupt cannot
+    // miss a one-cycle copy_done pulse.
+    output reg o_snapshot_ready,
     output reg [`DDR_SLOT_IDX_W-1:0] o_last_slot,
     output reg [31:0] o_snapshot_seq, output reg [31:0] o_drop_count,
     output wire [31:0] o_slot0_len, output wire [31:0] o_slot1_len,
@@ -110,6 +114,7 @@ module pd_ddr_slot_mgr #(
             o_copy_src_addr <= 0; o_copy_dst_addr <= 0; o_copy_len <= 0;
             o_slot_full <= 1'b0; o_cfg_err <= 1'b0; o_cmd_err <= 1'b0;
             o_req_overflow <= 1'b0; o_last_slot <= 0;
+            o_snapshot_ready <= 1'b0;
             o_snapshot_seq <= 0; o_drop_count <= 0;
             for (k=0; k<`DDR_SLOT_NUM; k=k+1) begin
                 slot_state[k] <= SLOT_FREE; slot_len[k] <= 0; slot_seq[k] <= 0;
@@ -119,6 +124,7 @@ module pd_ddr_slot_mgr #(
             if (i_status_clear) begin
                 o_slot_full <= 1'b0; o_cfg_err <= 1'b0;
                 o_cmd_err <= 1'b0; o_req_overflow <= 1'b0;
+                o_snapshot_ready <= 1'b0;
             end
             if (i_req_overflow) begin
                 o_req_overflow <= 1'b1;
@@ -148,6 +154,7 @@ module pd_ddr_slot_mgr #(
                 slot_seq[active_slot] <= o_snapshot_seq + 1'b1;
                 o_snapshot_seq <= o_snapshot_seq + 1'b1;
                 o_last_slot <= active_slot;
+                o_snapshot_ready <= 1'b1;
                 active_valid <= 1'b0;
             end else if (active_valid && i_copy_err) begin
                 slot_state[active_slot] <= SLOT_FREE;

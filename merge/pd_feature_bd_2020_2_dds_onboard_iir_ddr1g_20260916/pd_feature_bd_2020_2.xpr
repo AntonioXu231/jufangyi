@@ -41,23 +41,23 @@
     <Option Name="IPCachePermission" Val="write"/>
     <Option Name="EnableCoreContainer" Val="FALSE"/>
     <Option Name="CreateRefXciForCoreContainers" Val="FALSE"/>
-    <Option Name="IPUserFilesDir" Val="$PPRDIR/../pd_feature_bd_2020_2/pd_feature_bd_2020_2.ip_user_files"/>
+    <Option Name="IPUserFilesDir" Val="$PIPUSERFILESDIR"/>
     <Option Name="IPStaticSourceDir" Val="$PPRDIR/../pd_feature_bd_2020_2/pd_feature_bd_2020_2.ip_user_files/ipstatic"/>
     <Option Name="EnableBDX" Val="FALSE"/>
-    <Option Name="WTXSimLaunchSim" Val="17"/>
+    <Option Name="WTXSimLaunchSim" Val="23"/>
     <Option Name="WTModelSimLaunchSim" Val="0"/>
     <Option Name="WTQuestaLaunchSim" Val="0"/>
     <Option Name="WTIesLaunchSim" Val="0"/>
     <Option Name="WTVcsLaunchSim" Val="0"/>
     <Option Name="WTRivieraLaunchSim" Val="0"/>
     <Option Name="WTActivehdlLaunchSim" Val="0"/>
-    <Option Name="WTXSimExportSim" Val="7"/>
-    <Option Name="WTModelSimExportSim" Val="7"/>
-    <Option Name="WTQuestaExportSim" Val="7"/>
-    <Option Name="WTIesExportSim" Val="7"/>
-    <Option Name="WTVcsExportSim" Val="7"/>
-    <Option Name="WTRivieraExportSim" Val="7"/>
-    <Option Name="WTActivehdlExportSim" Val="7"/>
+    <Option Name="WTXSimExportSim" Val="9"/>
+    <Option Name="WTModelSimExportSim" Val="9"/>
+    <Option Name="WTQuestaExportSim" Val="9"/>
+    <Option Name="WTIesExportSim" Val="9"/>
+    <Option Name="WTVcsExportSim" Val="9"/>
+    <Option Name="WTRivieraExportSim" Val="9"/>
+    <Option Name="WTActivehdlExportSim" Val="9"/>
     <Option Name="GenerateIPUpgradeLog" Val="TRUE"/>
     <Option Name="XSimRadix" Val="hex"/>
     <Option Name="XSimTimeUnit" Val="ns"/>
@@ -73,114 +73,6 @@
   <FileSets Version="1" Minor="31">
     <FileSet Name="sources_1" Type="DesignSrcs" RelSrcDir="$PSRCDIR/sources_1" RelGenDir="$PGENDIR/sources_1">
       <Filter Type="Srcs"/>
-      <File Path="$PSRCDIR/sources_1/imports/rtl/adc_capture.v">
-        <FileInfo>
-          <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/rtl/adc_capture.v"/>
-          <Attr Name="ImportTime" Val="1788335424"/>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PSRCDIR/sources_1/imports/rtl/async_fifo.v">
-        <FileInfo>
-          <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/rtl/async_fifo.v"/>
-          <Attr Name="ImportTime" Val="1788936368"/>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PSRCDIR/sources_1/imports/rtl/pd_adc_cdc.v">
-        <FileInfo>
-          <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/rtl/pd_adc_cdc.v"/>
-          <Attr Name="ImportTime" Val="1788849626"/>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PSRCDIR/sources_1/imports/rtl/pd_defines.vh">
-        <FileInfo>
-          <Attr Name="IsGlobalInclude" Val="1"/>
-          <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/rtl/pd_defines.vh"/>
-          <Attr Name="ImportTime" Val="1788917302"/>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PSRCDIR/sources_1/imports/rtl/pd_axil_regs.v">
-        <FileInfo>
-          <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/rtl/pd_axil_regs.v"/>
-          <Attr Name="ImportTime" Val="1788953354"/>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PSRCDIR/sources_1/imports/rtl/pd_axis_arb.v">
-        <FileInfo>
-          <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/rtl/pd_axis_arb.v"/>
-          <Attr Name="ImportTime" Val="1788334672"/>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PSRCDIR/sources_1/imports/rtl/pd_axis_fifo.v">
-        <FileInfo>
-          <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/rtl/pd_axis_fifo.v"/>
-          <Attr Name="ImportTime" Val="1788334672"/>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PSRCDIR/sources_1/imports/rtl/pd_feature_core.v">
-        <FileInfo>
-          <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/rtl/pd_feature_core.v"/>
-          <Attr Name="ImportTime" Val="1789010453"/>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PSRCDIR/sources_1/imports/rtl/pd_feature_top.v">
-        <FileInfo>
-          <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/rtl/pd_feature_top.v"/>
-          <Attr Name="ImportTime" Val="1788334672"/>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PSRCDIR/sources_1/imports/rtl/pd_prpd_ram.v">
-        <FileInfo>
-          <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/rtl/pd_prpd_ram.v"/>
-          <Attr Name="ImportTime" Val="1788334672"/>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PSRCDIR/sources_1/imports/rtl/pd_feature_sys_top.v">
-        <FileInfo>
-          <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/rtl/pd_feature_sys_top.v"/>
-          <Attr Name="ImportTime" Val="1788942269"/>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PSRCDIR/sources_1/imports/rtl/pd_sync_pulse.v">
-        <FileInfo>
-          <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/rtl/pd_sync_pulse.v"/>
-          <Attr Name="ImportTime" Val="1788940837"/>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
       <File Path="$PSRCDIR/sources_1/ip/dm_cp/dm_cp.xci">
         <FileInfo>
           <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/ip/dm_cp/dm_cp.xci"/>
@@ -312,6 +204,105 @@
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
       </File>
+      <File Path="$PSRCDIR/sources_1/imports/rtl/adc_capture.v">
+        <FileInfo>
+          <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/rtl/adc_capture.v"/>
+          <Attr Name="ImportTime" Val="1788335424"/>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="implementation"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PSRCDIR/sources_1/imports/rtl/async_fifo.v">
+        <FileInfo>
+          <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/rtl/async_fifo.v"/>
+          <Attr Name="ImportTime" Val="1788936368"/>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="implementation"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PSRCDIR/sources_1/imports/rtl/pd_adc_cdc.v">
+        <FileInfo>
+          <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/rtl/pd_adc_cdc.v"/>
+          <Attr Name="ImportTime" Val="1788849626"/>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="implementation"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PSRCDIR/sources_1/imports/rtl/pd_defines.vh">
+        <FileInfo>
+          <Attr Name="IsGlobalInclude" Val="1"/>
+          <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/rtl/pd_defines.vh"/>
+          <Attr Name="ImportTime" Val="1788917302"/>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PSRCDIR/sources_1/imports/rtl/pd_axil_regs.v">
+        <FileInfo>
+          <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/rtl/pd_axil_regs.v"/>
+          <Attr Name="ImportTime" Val="1788953354"/>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="implementation"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PSRCDIR/sources_1/imports/rtl/pd_axis_arb.v">
+        <FileInfo>
+          <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/rtl/pd_axis_arb.v"/>
+          <Attr Name="ImportTime" Val="1788334672"/>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="implementation"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PSRCDIR/sources_1/imports/rtl/pd_axis_fifo.v">
+        <FileInfo>
+          <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/rtl/pd_axis_fifo.v"/>
+          <Attr Name="ImportTime" Val="1788334672"/>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="implementation"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PSRCDIR/sources_1/imports/rtl/pd_feature_core.v">
+        <FileInfo>
+          <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/rtl/pd_feature_core.v"/>
+          <Attr Name="ImportTime" Val="1789010453"/>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="implementation"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PSRCDIR/sources_1/imports/rtl/pd_feature_top.v">
+        <FileInfo>
+          <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/rtl/pd_feature_top.v"/>
+          <Attr Name="ImportTime" Val="1788334672"/>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="implementation"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PSRCDIR/sources_1/imports/rtl/pd_prpd_ram.v">
+        <FileInfo>
+          <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/rtl/pd_prpd_ram.v"/>
+          <Attr Name="ImportTime" Val="1788334672"/>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="implementation"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PSRCDIR/sources_1/imports/rtl/pd_feature_sys_top.v">
+        <FileInfo>
+          <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/rtl/pd_feature_sys_top.v"/>
+          <Attr Name="ImportTime" Val="1788942269"/>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="implementation"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
       <File Path="$PSRCDIR/sources_1/imports/rtl/pd_iir_biquad.v">
         <FileInfo>
           <Attr Name="UsedIn" Val="synthesis"/>
@@ -320,6 +311,29 @@
         </FileInfo>
       </File>
       <File Path="$PSRCDIR/sources_1/imports/rtl/pd_filter_chain.v">
+        <FileInfo>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="implementation"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PSRCDIR/sources_1/imports/rtl/pd_sync_pulse.v">
+        <FileInfo>
+          <Attr Name="ImportPath" Val="$PPRDIR/../../../../pd_feature_bd_vivado2020_2/rtl/pd_sync_pulse.v"/>
+          <Attr Name="ImportTime" Val="1788940837"/>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="implementation"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PSRCDIR/sources_1/imports/rtl/pd_fft_input_adapter_4ch.v">
+        <FileInfo>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="implementation"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PSRCDIR/sources_1/imports/rtl/pd_fft_bin_monitor_4ch.v">
         <FileInfo>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
@@ -385,8 +399,40 @@
     </FileSet>
     <FileSet Name="sim_1" Type="SimulationSrcs" RelSrcDir="$PSRCDIR/sim_1" RelGenDir="$PGENDIR/sim_1">
       <Filter Type="Srcs"/>
+      <File Path="$PGENDIR/sources_1/bd/pd_feature_bd/ip/pd_feature_bd_xfft_0_0/sim/pd_feature_bd_xfft_0_0.vhd">
+        <FileInfo>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PGENDIR/sources_1/bd/pd_feature_bd/ip/pd_feature_bd_xfft_ch0_3/sim/pd_feature_bd_xfft_ch0_3.vhd">
+        <FileInfo>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PGENDIR/sources_1/bd/pd_feature_bd/ip/pd_feature_bd_xfft_ch0_4/sim/pd_feature_bd_xfft_ch0_4.vhd">
+        <FileInfo>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PGENDIR/sources_1/bd/pd_feature_bd/ip/pd_feature_bd_xfft_ch0_5/sim/pd_feature_bd_xfft_ch0_5.vhd">
+        <FileInfo>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
+      <File Path="$PSRCDIR/sim_1/new/tb_pd_fft_chain.v">
+        <FileInfo>
+          <Attr Name="UsedIn" Val="synthesis"/>
+          <Attr Name="UsedIn" Val="implementation"/>
+          <Attr Name="UsedIn" Val="simulation"/>
+        </FileInfo>
+      </File>
       <File Path="$PSRCDIR/sim_1/new/tb_pd_feature_dds.v">
         <FileInfo>
+          <Attr Name="AutoDisabled" Val="1"/>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
           <Attr Name="UsedIn" Val="simulation"/>
@@ -415,7 +461,7 @@
       </File>
       <Config>
         <Option Name="DesignMode" Val="RTL"/>
-        <Option Name="TopModule" Val="tb_pd_feature_dds"/>
+        <Option Name="TopModule" Val="tb_pd_fft_chain"/>
         <Option Name="TopLib" Val="xil_defaultlib"/>
         <Option Name="TransportPathDelay" Val="0"/>
         <Option Name="TransportIntDelay" Val="0"/>

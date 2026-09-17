@@ -189,6 +189,7 @@ module pd_ddr_wr_top #(
     wire [3:0]           slot_valid, slot_busy, slot_locked;
     wire                 slot_full, slot_cfg_err, slot_cmd_err;
     wire                 slot_req_overflow, slot_req_pending;
+    wire                 slot_snapshot_ready;
     wire [1:0]           slot_last;
     wire [31:0]          slot_snapshot_seq, slot_drop_count;
     wire [31:0]          slot0_len, slot1_len, slot2_len, slot3_len;
@@ -612,6 +613,7 @@ module pd_ddr_wr_top #(
         .o_cmd_err           (slot_cmd_err),
         .o_req_overflow      (slot_req_overflow),
         .o_req_pending       (slot_req_pending),
+        .o_snapshot_ready    (slot_snapshot_ready),
         .o_last_slot         (slot_last),
         .o_snapshot_seq      (slot_snapshot_seq),
         .o_drop_count        (slot_drop_count),
@@ -718,6 +720,7 @@ module pd_ddr_wr_top #(
         .i_slot_cmd_err (slot_cmd_err),
         .i_slot_req_overflow(slot_req_overflow),
         .i_slot_req_pending(slot_req_pending),
+        .i_slot_snapshot_ready(slot_snapshot_ready),
         .i_slot_last    (slot_last),
         .i_slot_snapshot_seq(slot_snapshot_seq),
         .i_slot_drop_count(slot_drop_count),
@@ -730,7 +733,11 @@ module pd_ddr_wr_top #(
     // =========================================================================
     // 11) 中断与调试观测
     // =========================================================================
-    assign irq = copy_done | snap_overrun | ring_err | ring_ovf | copy_err | snapshot_cfg_err;
+    // slot_snapshot_ready is level-held until SLOT_CTRL.status_clear.  This
+    // converts an otherwise one-cycle automatic-copy completion into a PS-
+    // observable interrupt without changing the external irq port contract.
+    assign irq = slot_snapshot_ready | copy_done | snap_overrun | ring_err |
+                 ring_ovf | copy_err | snapshot_cfg_err;
     assign dbg_ddr = {
         ring_state,          // [15:14]
         copy_busy,           // [13]
