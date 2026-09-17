@@ -35,7 +35,7 @@
 //                          [11:8]release(W1P) [12]status_clear(W1P)
 //   0x50 SLOT_STATUS    RO  [3:0]valid [7:4]busy [11:8]locked [12]full
 //                          [13]cfg_err [14]req_overflow [15]cmd_err
-//                          [16]pending [18:17]last_slot
+//                          [16]pending [18:17]last_slot [19]snapshot_ready
 //   0x54 SLOT_SEQ       RO  自动快照成功序号
 //   0x58 SLOT_DROPS     RO  自动请求拒绝/溢出累计数
 //   0x5C RESERVED       RO  固定读回 0
@@ -109,6 +109,7 @@ module pd_ddr_axil #(
     input  wire            i_slot_cmd_err,
     input  wire            i_slot_req_overflow,
     input  wire            i_slot_req_pending,
+    input  wire            i_slot_snapshot_ready,
     input  wire [1:0]      i_slot_last,
     input  wire [31:0]     i_slot_snapshot_seq,
     input  wire [31:0]     i_slot_drop_count,
@@ -316,7 +317,7 @@ module pd_ddr_axil #(
                     A_SNAP_BYTES:s_axi_rdata <= i_copy_bytes_done;
                     A_SNAP_SEQ:  s_axi_rdata <= snap_seq;
                     A_SLOT_CTRL: s_axi_rdata <= {31'd0, o_auto_snap_en};
-                    A_SLOT_STATUS:s_axi_rdata <= {13'd0, i_slot_last,
+                    A_SLOT_STATUS:s_axi_rdata <= {12'd0, i_slot_snapshot_ready, i_slot_last,
                                                    i_slot_req_pending, i_slot_cmd_err,
                                                    i_slot_req_overflow, i_slot_cfg_err,
                                                    i_slot_full, i_slot_locked,
