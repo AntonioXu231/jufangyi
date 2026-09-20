@@ -25,6 +25,9 @@ module pd_ddr_bd_adapter #(
     input  wire [CH_NUM*ADC_W-1:0]   adc_data,
     input  wire [CH_NUM-1:0]         adc_dv,
     input  wire                      cycle_start,
+    // Feature-domain pulse generated when each channel retains an event.
+    // Same clk domain as this adapter's clk input.
+    input  wire [CH_NUM-1:0]         i_event_accept,
 
     output wire [CH_NUM*ADC_W-1:0]   o_feat_data,
     output wire [CH_NUM-1:0]         o_feat_dv,
@@ -201,6 +204,7 @@ module pd_ddr_bd_adapter #(
         .o_feat_dv       (o_feat_dv),
         .o_feat_ovf      (o_feat_ovf),
         .cycle_start     (cycle_start),
+        .i_event_accept  (i_event_accept),
         .s_axi_awaddr    (s_axi_awaddr),
         .s_axi_awvalid   (s_axi_awvalid),
         .s_axi_awready   (s_axi_awready),

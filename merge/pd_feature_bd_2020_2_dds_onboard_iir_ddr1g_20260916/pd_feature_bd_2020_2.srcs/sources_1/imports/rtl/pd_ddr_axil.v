@@ -38,8 +38,10 @@
 //                          [16]pending [18:17]last_slot [19]snapshot_ready
 //   0x54 SLOT_SEQ       RO  自动快照成功序号
 //   0x58 SLOT_DROPS     RO  自动请求拒绝/溢出累计数
-//   0x5C RESERVED       RO  固定读回 0
+//   0x5C SNAP_TRIG_CTRL RW  [0]event_trig_en [4:1]event_ch_mask
+//                          [8]drop_count_clear(W1P) / RO [16]armed [17]drop
 //   0x60..0x9C          RO  四槽描述符：BASE / LEN / SEQ / FLAGS
+//   0xA0 SNAP_TRIG_DROPS RO 自动触发因四槽全满而被拒绝的累计数
 // =============================================================================
 `include "pd_ddr_defines.vh"
 
@@ -79,6 +81,9 @@ module pd_ddr_axil #(
     output reg             o_freeze_resume,
     output reg             o_snap_start,      // 调试用：手动触发一次拷贝
     output reg             o_auto_snap_en,
+    output reg             o_event_trig_en,
+    output reg  [3:0]      o_event_trig_mask,
+    output reg             o_event_trig_stat_clear,
     output reg  [3:0]      o_slot_lock,
     output reg  [3:0]      o_slot_release,
     output reg             o_slot_status_clear,
@@ -113,6 +118,9 @@ module pd_ddr_axil #(
     input  wire [1:0]      i_slot_last,
     input  wire [31:0]     i_slot_snapshot_seq,
     input  wire [31:0]     i_slot_drop_count,
+    input  wire            i_event_trig_armed,
+    input  wire            i_event_trig_slot_full_drop,
+    input  wire [31:0]     i_event_trig_drop_count,
     input  wire [31:0]     i_slot0_len,
     input  wire [31:0]     i_slot1_len,
     input  wire [31:0]     i_slot2_len,
@@ -146,7 +154,7 @@ module pd_ddr_axil #(
     localparam [11:0] A_SLOT_STATUS=12'h50;
     localparam [11:0] A_SLOT_SEQ  = 12'h54;
     localparam [11:0] A_SLOT_DROPS= 12'h58;
-    localparam [11:0] A_SLOT_RSVD = 12'h5C;
+    localparam [11:0] A_SNAP_TRIG_CTRL = 12'h5C;
     localparam [11:0] A_SLOT0_BASE= 12'h60;
     localparam [11:0] A_SLOT0_LEN = 12'h64;
     localparam [11:0] A_SLOT0_SEQ = 12'h68;
@@ -163,6 +171,7 @@ module pd_ddr_axil #(
     localparam [11:0] A_SLOT3_LEN = 12'h94;
     localparam [11:0] A_SLOT3_SEQ = 12'h98;
     localparam [11:0] A_SLOT3_FLAGS=12'h9C;
+    localparam [11:0] A_SNAP_TRIG_DROPS = 12'hA0;
 
     // ---------------- 写通道：AW/W 同时收，再回 B ----------------
     reg [11:0] waddr;
@@ -226,9 +235,13 @@ module pd_ddr_axil #(
             o_snap_start    <= 1'b0;
             o_sw_rst        <= 1'b0;
             o_auto_snap_en  <= 1'b0;
+            o_event_trig_en <= 1'b0;
+            o_event_trig_mask <= 4'hF;
+            o_event_trig_stat_clear <= 1'b0;
             o_slot_lock     <= 4'b0;
             o_slot_release  <= 4'b0;
             o_slot_status_clear <= 1'b0;
+            o_event_trig_stat_clear <= 1'b0;
         end else begin
             o_freeze_trig   <= 1'b0;   // 脉冲型，默认撤销
             o_freeze_resume <= 1'b0;
@@ -267,6 +280,14 @@ module pd_ddr_axil #(
                         if (wstrb[0]) o_slot_lock <= wdata[7:4];
                         if (wstrb[1]) o_slot_release <= wdata[11:8];
                         if (wstrb[1] && wdata[12]) o_slot_status_clear <= 1'b1;
+                    end
+                    A_SNAP_TRIG_CTRL: begin
+                        if (wstrb[0]) begin
+                            o_event_trig_en   <= wdata[0];
+                            o_event_trig_mask <= wdata[4:1];
+                        end
+                        if (wstrb[1] && wdata[8])
+                            o_event_trig_stat_clear <= 1'b1;
                     end
                     default: ;
                 endcase
@@ -324,7 +345,11 @@ module pd_ddr_axil #(
                                                    i_slot_busy, i_slot_valid};
                     A_SLOT_SEQ: s_axi_rdata <= i_slot_snapshot_seq;
                     A_SLOT_DROPS: s_axi_rdata <= i_slot_drop_count;
-                    A_SLOT_RSVD: s_axi_rdata <= 32'd0;
+                    A_SNAP_TRIG_CTRL: s_axi_rdata <= {
+                        14'd0, i_event_trig_slot_full_drop,
+                        i_event_trig_armed, 11'd0,
+                        o_event_trig_mask, o_event_trig_en
+                    };
                     A_SLOT0_BASE:s_axi_rdata <= `DDR_SLOT0_BASE;
                     A_SLOT0_LEN:s_axi_rdata <= i_slot0_len;
                     A_SLOT0_SEQ:s_axi_rdata <= i_slot0_seq;
@@ -341,6 +366,7 @@ module pd_ddr_axil #(
                     A_SLOT3_LEN:s_axi_rdata <= i_slot3_len;
                     A_SLOT3_SEQ:s_axi_rdata <= i_slot3_seq;
                     A_SLOT3_FLAGS:s_axi_rdata <= {29'd0, i_slot_locked[3], i_slot_busy[3], i_slot_valid[3]};
+                    A_SNAP_TRIG_DROPS: s_axi_rdata <= i_event_trig_drop_count;
                     default:     s_axi_rdata <= 32'd0;
                 endcase
             end else begin

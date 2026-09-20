@@ -3,7 +3,7 @@
 // W independently; reset defaults to a bit-exact external bypass.
 module pd_filter_chain #(
     parameter integer NUM_CH=4, ADC_W=12, DW=16, CW=18, FW=16,
-    parameter integer N_BP=2, N_NT=6, CLK_HZ=130000000, SAMPLE_HZ=26000000,
+    parameter integer N_BP=1, N_NT=0, CLK_HZ=130000000, SAMPLE_HZ=26000000,
     parameter integer C_S_AXI_DATA_WIDTH=32, C_S_AXI_ADDR_WIDTH=16
 )(
     (* X_INTERFACE_PARAMETER = "XIL_INTERFACENAME CLK, FREQ_HZ 130000000, ASSOCIATED_BUSIF S_AXI" *)

@@ -6,7 +6,26 @@
 
 ### 计划中
 
-- 暂无。
+- 暴露 `o_last_btt` / `o_sts_tdata`，或把已存在但未接线的 `dbg_ddr` 引入 AXI4-Lite 读回，以区分 `ring_err` 与 `ring_ovf`。
+- 顶层快照闭环仿真、DMA/TREADY 门禁、滤波旁路态与滤波态 A/B 标定、PS FFT 与频谱服务、65 MSPS CIC 抽取架构。
+
+## [v1.6.0] - 2026-09-20
+
+### 移除四路 PL FFT、P1 滤波降载与事件自动快照触发
+
+- 按最终定稿的架构裁决移除 `v1.5.0` 引入的四路 1024 点 PL FFT 实验支路（`pd_fft_input_adapter_4ch.v`、`pd_fft_bin_monitor_4ch.v`、`xfft_ch0_*` IP 及专用 testbench 与波形集）；FFT 固定由 PS 从 DDR 原始快照执行，分析支路不得对主采集链施加反压。
+- 对 `pd_filter_0` 执行 P1 降载：`N_BP` 2→1、`N_NT` 6→0。综合 DSP 由 84 降为 28；实现后 Slice 由 `95.08%` 降至 `73.34%`，余量恢复约 22 个百分点。
+- 在 `pd_ddr_0` 中加入事件自动快照触发：`pd_feature_0` 的 `event_accept` 驱动冻结与四槽复制；新增 `0x5C SNAP_TRIG_CTRL` 与 `0xA0 SNAP_TRIG_DROPS`，位于既有地址表末尾之后，既有偏移与手动 `SNAP_START` 语义不变。
+- 新增 PS 侧冒烟测试 `pd_snapshot_poll.c`（轮询方式验证 PL/DDR/AXI-Lite 契约，并把 `DDR_STATUS[5]` 纳入错误判据）与 `pd_filter_apply.c`；新增 IIR 系数文件与 MATLAB 生成脚本，含 16.25 MSPS / 65 MSPS 预研系数。
+- 数据流定案：DDR 保存原始 ADC 样点，`pd_filter_0 → pd_feature_0` 为实时判决支路，PL 保留实时 PRPD 作为产品主路径，PS PRPD 仅用于离线校核。
+
+### 验证状态
+
+- 行为仿真：`tb_pd_snapshot_trigger` 与 `tb_pd_filter_chain` 分别输出 `TB_PD_SNAPSHOT_TRIGGER_PASS`、`TB_PD_FILTER_CHAIN_PASS`。
+- 综合：通过。Slice LUT 26,048、DSP 28、RAMB36 22、RAMB18 9；零 ERROR、零 CRITICAL WARNING。
+- 实现：已完成，**但时序未收敛**。`WNS=-0.054 ns`、`TNS=-0.491 ns`（19 / 91,518 端点，全部位于 `clk_out1` 129.994 MHz 域，关键路径为 `pd_ddr_0` 环形写的写偏移到剩余量运算链）；`WHS=+0.036 ns`、`THS=0.000 ns`；`Place 30-487` = 0；布线错误 0。**当前 bitstream/XSA 含 `dbg_hub`/ILA（`timing_summary_routed.rpt` 中 1,311 处引用），仅可作调试版本，不得用于发布。**
+- 上板：PS 冒烟测试**未通过**。串口输出 `SNAPSHOT_FAIL: DDR ring err sticky (DDR_STATUS[5])`，`DDR_STATUS=0x00000021`、`SLOT_STATUS=0x00000000`、`TRIG=0x0001001F`。bit5 经复核为 `ring_err | ring_ovf | copy_err | snapshot_cfg_err` 四路或（`pd_ddr_wr_top.v:743`），实测 bit8/bit9 为 0，即实际为 `ring_err | ring_ovf`；因 `o_last_btt`/`o_sts_tdata` 悬空、`dbg_ddr` 在 `.bd` 中未接线，**来源尚无法区分，根因未确定**。
+- 顶层快照闭环仿真、DMA S2MM 与 `m_axis` TREADY 门禁、滤波旁路态与滤波态 A/B 标定、PS FFT 与频谱服务、四槽长期轮转、GIC 中断服务、65 MSPS CIC 抽取架构、真实 AD9226 与上位机：均**未执行**；不得据此版本声明上述项目已经验证。
 
 ## [v1.5.0] - 2026-09-17
 

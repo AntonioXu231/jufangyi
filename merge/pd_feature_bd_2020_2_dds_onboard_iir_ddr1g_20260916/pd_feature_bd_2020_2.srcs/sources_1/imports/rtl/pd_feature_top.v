@@ -69,6 +69,12 @@ module pd_feature_top #(
     output wire                            m_axis_tlast,
     input  wire                            m_axis_tready,
 
+    // A channel bit is asserted for one clk when that channel's event is
+    // accepted by its local FIFO.  It is intentionally independent of the
+    // downstream AXI DMA handshake and feeds the optional DDR auto-snapshot
+    // trigger only; the public AXI-Stream event contract is unchanged.
+    output wire [NUM_CH-1:0]               o_event_accept,
+
     output wire                            irq
 );
 
@@ -365,5 +371,9 @@ module pd_feature_top #(
             ev_cnt <= ev_cnt + 64'd1;
     end
     assign w_event_count = ev_cnt;
+
+    // c_tready is driven by the local event FIFO.  Therefore this pulse means
+    // the feature event has been retained, rather than merely detected.
+    assign o_event_accept = c_tvalid & c_tready;
 
 endmodule
