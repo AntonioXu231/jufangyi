@@ -24,7 +24,12 @@
 - 行为仿真：`tb_pd_snapshot_trigger` 与 `tb_pd_filter_chain` 分别输出 `TB_PD_SNAPSHOT_TRIGGER_PASS`、`TB_PD_FILTER_CHAIN_PASS`。
 - 综合：通过。Slice LUT 26,048、DSP 28、RAMB36 22、RAMB18 9；零 ERROR、零 CRITICAL WARNING。
 - 实现：已完成，**但时序未收敛**。`WNS=-0.054 ns`、`TNS=-0.491 ns`（19 / 91,518 端点，全部位于 `clk_out1` 129.994 MHz 域，关键路径为 `pd_ddr_0` 环形写的写偏移到剩余量运算链）；`WHS=+0.036 ns`、`THS=0.000 ns`；`Place 30-487` = 0；布线错误 0。**当前 bitstream/XSA 含 `dbg_hub`/ILA（`timing_summary_routed.rpt` 中 1,311 处引用），仅可作调试版本，不得用于发布。**
-- 上板：PS 冒烟测试**未通过**。串口输出 `SNAPSHOT_FAIL: DDR ring err sticky (DDR_STATUS[5])`，`DDR_STATUS=0x00000021`、`SLOT_STATUS=0x00000000`、`TRIG=0x0001001F`。bit5 经复核为 `ring_err | ring_ovf | copy_err | snapshot_cfg_err` 四路或（`pd_ddr_wr_top.v:743`），实测 bit8/bit9 为 0，即实际为 `ring_err | ring_ovf`；因 `o_last_btt`/`o_sts_tdata` 悬空、`dbg_ddr` 在 `.bd` 中未接线，**来源尚无法区分，根因未确定**。
+- 上板：快照链路**通过**，`DDR_STATUS[5]` **已解释为一次性启动瞬态**。
+  - 快照链路：`SNAPSHOT slot=0 base=0x20001000 len=3120000 seq=1 flags=0x1`；`SLOT_STATUS=0x00080001`（slot0 valid + `snapshot_ready`）；`SNAPSHOT_DATA first=0x118007FC last=0x81A7F67F`（非平凡）。
+  - 环形写通路：`ΔWR_BYTES / ΔCMD == 1536` 精确等于 `DDR_BURST_BYTES`，两段区间均复现；`PTR` 增量与 `WR_BYTES` 增量逐段相等。
+  - `DDR_STATUS[5]`：经粘滞清零复测确认为**一次性启动瞬态**（`PROGRESS[CLEARED] STS=0x00000001`，bit5=0；清零后约 45 ms 不复现）。根因是 `ring_ovf`（上游溢出）：`up_ovf`（`pd_ddr_wr_top.v:413`）与 `beat_en`（`:341`）均不受 `acq_en` 门控，采集关闭期间上游持续喂数、信用堆到 `AVAIL=4144`（≥`OVF_THRESH` 3072）；而 `pd_ddr_ring_wr.v:428` 的 `!i_acq_en` 优先分支把 `o_err` 强制清零，故 `acq_en` 为 0 时读不到，`acq_en=1` 那一拍立即置位。建议修法（本版本未实施）：用 `acq_en` 门控 `i_beat_en`/`up_ovf`，或在 `acq_en` 上升沿清 `avail_bytes`。
+  - 四槽轮转与槽满拒绝：**通过**。逐槽加锁且不释放，迫使分配器走遍四槽：slot `0→1→2→3`，基数 `0x20001000` / `0x20C01000` / `0x21801000` / `0x22401000`（相邻间隔均为 12 MiB），`seq` 1/2/3/4，`len` 均 3,120,000；第 5 次请求被拒（`SLOT_STATUS[12] full=1`，`SLOT_DROPS 0→2`）；四槽释放均无 `cmd_err`。
+  - 快照数据**内容**正确性：**通过**。全槽 520,000 点统计：四通道 `min` 精确等于 `2032/2040/2006/2046`（三角带下界），超出三角带上界的采样数精确等于 4/通道（每通道恰好一个 4 样点脉冲），`max` 均落在期望区间。另取前 256 个采样点 dump，经 256 候选起始相位搜索得**唯一解** `n0=60`（第二轮 `n0=59`）且 **32/32 逐位全中**。字节序、通道位分配、块内 `W0..W3` 时间顺序、基线与 shift 全部确证，链路端到端无损。
 - 顶层快照闭环仿真、DMA S2MM 与 `m_axis` TREADY 门禁、滤波旁路态与滤波态 A/B 标定、PS FFT 与频谱服务、四槽长期轮转、GIC 中断服务、65 MSPS CIC 抽取架构、真实 AD9226 与上位机：均**未执行**；不得据此版本声明上述项目已经验证。
 
 ## [v1.5.0] - 2026-09-17
