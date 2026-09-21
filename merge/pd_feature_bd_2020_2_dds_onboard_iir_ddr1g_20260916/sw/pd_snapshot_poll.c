@@ -45,6 +45,7 @@
 #define DDR_SLOT_AREA_END        0x23001000U
 
 #define DDR_STATUS_COPY_BUSY     (1U << 1)
+#define DDR_STATUS_ERR           (1U << 5)
 #define DDR_STATUS_COPY_DONE     (1U << 6)
 #define DDR_STATUS_COPY_ERR      (1U << 8)
 #define DDR_STATUS_CFG_ERR       (1U << 9)
@@ -66,7 +67,8 @@
 #define TRIG_DROP                (1U << 17)
 
 #define SNAPSHOT_TIMEOUT         120000000U
-#define POLL_PRINT_PERIOD        10000000U
+#define POLL_PRINT_PERIOD        100000U
+#define STARTUP_CLEAR_TIMEOUT    1000000U
 
 static u32 reg_read(u32 off)
 {
@@ -79,6 +81,27 @@ static void reg_write(u32 off, u32 value)
 }
 
 static void fail_stop(const char *reason);
+
+/*
+ * DDR_STATUS[5] is owned by pd_ddr_ring_wr, not slot_mgr.  A prior halted
+ * smoke test can therefore leave it asserted across ELF downloads.  Clear it
+ * before arming a new run and prove the hardware accepted the acknowledgement.
+ */
+static void clear_ring_error_before_arm(void)
+{
+    u32 i;
+
+    reg_write(DDR_CTRL, 0U);       /* o_err clear condition: !i_acq_en */
+    reg_write(FREEZE_CTRL, 2U);    /* also clear/release any old freeze state */
+
+    for (i = 0U; i < STARTUP_CLEAR_TIMEOUT; ++i) {
+        u32 status = reg_read(DDR_STATUS);
+        if ((status & (1U | DDR_STATUS_ERR)) == 0U)
+            return;
+    }
+
+    fail_stop("stale DDR ring error did not clear while acquisition was disabled");
+}
 
 static void verify_register_contract(void)
 {
@@ -108,7 +131,7 @@ static void fail_stop(const char *reason)
     }
 }
 
-static u32 wait_snapshot_ready(void)
+static u32 wait_snapshot_ready_after(u32 seq_before)
 {
     u32 i;
     for (i = 0; i < SNAPSHOT_TIMEOUT; ++i) {
@@ -118,7 +141,9 @@ static u32 wait_snapshot_ready(void)
             fail_stop("slot manager error");
         if (ddr_status & (DDR_STATUS_COPY_ERR | DDR_STATUS_CFG_ERR))
             fail_stop("DDR copy/config error");
-        if (status & SLOT_READY)
+        /* Ring ERR is sampled by the caller after READY, then acknowledged by
+         * FREEZE_RESUME.  It may contain the known acquisition-startup pulse. */
+        if ((status & SLOT_READY) && (reg_read(SLOT_SEQ) > seq_before))
             return status;
         if ((i % POLL_PRINT_PERIOD) == 0U)
             xil_printf("WAIT i=%u DDR_STATUS=0x%08x SLOT_STATUS=0x%08x\r\n",
@@ -128,7 +153,33 @@ static u32 wait_snapshot_ready(void)
     return 0U;
 }
 
-static void verify_slot(u32 slot, u32 status)
+/* First full-slot request reaches slot_mgr before slot_full has propagated to
+ * pd_snapshot_trigger.  SLOT_DROPS is therefore the pass/fail evidence here.
+ */
+static void wait_slot_mgr_rejection(u32 slot_drops_before)
+{
+    u32 i;
+
+    for (i = 0; i < SNAPSHOT_TIMEOUT; ++i) {
+        u32 status = reg_read(SLOT_STATUS);
+        u32 slot_drops = reg_read(SLOT_DROPS);
+        u32 ddr_status = reg_read(DDR_STATUS);
+
+        if (status & (SLOT_CFG_ERR | SLOT_REQ_OVERFLOW | SLOT_CMD_ERR))
+            fail_stop("slot manager error during full-slot test");
+        if (ddr_status & (DDR_STATUS_COPY_ERR | DDR_STATUS_CFG_ERR))
+            fail_stop("DDR error during full-slot test");
+        if ((status & SLOT_FULL) && (slot_drops > slot_drops_before))
+            return;
+        if ((i % POLL_PRINT_PERIOD) == 0U)
+            xil_printf("WAIT_FULL i=%u SLOT=0x%08x SLOT_DROPS=%u TRIG_DROPS=%u\r\n",
+                       i, status, slot_drops, reg_read(SNAP_TRIG_DROPS));
+    }
+
+    fail_stop("slot-manager full-slot rejection was not observed");
+}
+
+static void verify_slot(u32 slot, u32 status, int keep_locked)
 {
     u32 base = reg_read(SLOT_BASE_OFF(slot));
     u32 len = reg_read(SLOT_LEN_OFF(slot));
@@ -147,8 +198,8 @@ static void verify_slot(u32 slot, u32 status)
     if (base < DDR_SLOT0_BASE || base >= DDR_SLOT_AREA_END ||
         len > DDR_SLOT_SIZE || base + len > DDR_SLOT_AREA_END)
         fail_stop("slot range outside fixed DDR area");
-    if ((status & SLOT_BUSY_MASK) != 0U)
-        fail_stop("slot remains busy after snapshot_ready");
+    if (status & (1U << (4U + slot)))
+        fail_stop("selected slot remains busy after snapshot_ready");
 
     /* Lock selected slot: SLOT_CTRL[7:4] is a W1P field, byte 0. */
     reg_write(SLOT_CTRL, 1U << (4U + slot));
@@ -162,19 +213,25 @@ static void verify_slot(u32 slot, u32 status)
     last = data[(len / sizeof(u32)) - 1U];
     xil_printf("SNAPSHOT_DATA first=0x%08x last=0x%08x\r\n", first, last);
 
-    /* Release selected slot: SLOT_CTRL[11:8] is W1P, byte 1. */
-    reg_write(SLOT_CTRL, 1U << (8U + slot));
-    status = reg_read(SLOT_STATUS);
-    if ((status & (1U << (8U + slot))) != 0U)
-        fail_stop("slot release did not clear lock");
+    if (!keep_locked) {
+        /* Release selected slot: SLOT_CTRL[11:8] is W1P, byte 1. */
+        reg_write(SLOT_CTRL, 1U << (8U + slot));
+        status = reg_read(SLOT_STATUS);
+        if ((status & (1U << (8U + slot))) != 0U)
+            fail_stop("slot release did not clear lock");
+    }
 }
 
 int main(void)
 {
     u32 status, trig, seq_before, seq_after, slot;
+    u32 err_first, err_after_resume;
+    u32 slot_drops_before;
 
     xil_printf("--- pd_snapshot_poll automatic snapshot test ---\r\n");
     verify_register_contract();
+
+    clear_ring_error_before_arm();
 
     /* Clear stale sticky status before enabling a new bounded run. */
     reg_write(SLOT_CTRL, (1U << 12));
@@ -200,13 +257,17 @@ int main(void)
         fail_stop("slot manager reported stale error");
 
     xil_printf("WAIT_EVENT: produce one DDS/feature event now\r\n");
-    status = wait_snapshot_ready();
+    status = wait_snapshot_ready_after(seq_before);
     slot = (status >> SLOT_LAST_SHIFT) & 0x3U;
-    verify_slot(slot, status);
+    err_first = reg_read(DDR_STATUS) & DDR_STATUS_ERR;
+    verify_slot(slot, status, 1);
 
     seq_after = reg_read(SLOT_SEQ);
     if (seq_after <= seq_before)
         fail_stop("snapshot sequence did not advance");
+
+    if (err_first)
+        xil_printf("WARN: DDR_STATUS[5] set after first snapshot; checking clear semantics\r\n");
 
     /* Resume is a W1P at FREEZE_CTRL[1]; this rearms event trigger logic. */
     reg_write(FREEZE_CTRL, 2U);
@@ -214,7 +275,38 @@ int main(void)
     if ((trig & TRIG_ARMED) == 0U)
         fail_stop("freeze_resume did not rearm trigger");
 
-    xil_printf("SNAPSHOT_POLL_PASS slot=%u seq=%u\r\n", slot, seq_after);
+    /* FREEZE_RESUME is also the documented acknowledge/clear for ring o_err. */
+    err_after_resume = reg_read(DDR_STATUS) & DDR_STATUS_ERR;
+    if (err_after_resume)
+        fail_stop("DDR_STATUS[5] remained set after freeze_resume");
+
+    /*
+     * Keep the first verified slot LOCKED, then consume three events to fill
+     * the other slots.  The fifth event must be rejected by slot_mgr.  That
+     * is the externally visible no-overwrite contract of this smoke test.
+     */
+    xil_printf("ROTATE: produce three more feature events to fill remaining slots\r\n");
+    while ((reg_read(SLOT_STATUS) & SLOT_VALID_MASK) != SLOT_VALID_MASK) {
+        u32 seq_now = reg_read(SLOT_SEQ);
+        status = wait_snapshot_ready_after(seq_now);
+        if (reg_read(SLOT_SEQ) <= seq_now)
+            fail_stop("rotation snapshot sequence did not advance");
+        reg_write(FREEZE_CTRL, 2U);
+        if ((reg_read(SNAP_TRIG_CTRL) & TRIG_ARMED) == 0U)
+            fail_stop("rotation freeze_resume did not rearm trigger");
+    }
+
+    slot_drops_before = reg_read(SLOT_DROPS);
+    xil_printf("FULL: produce one additional feature event; slot_mgr must reject it\r\n");
+    wait_slot_mgr_rejection(slot_drops_before);
+
+    /* Return ownership to the ring.  SNAP_TRIG_DROPS remains a diagnostic;
+     * proving that counter requires a separately controlled event injector. */
+    reg_write(FREEZE_CTRL, 2U);
+
+    xil_printf("SNAPSHOT_POLL_PASS slot=%u seq=%u err_first=%u slot_drops=%u trig_drops=%u\r\n",
+               slot, seq_after, err_first ? 1U : 0U,
+               reg_read(SLOT_DROPS), reg_read(SNAP_TRIG_DROPS));
     xil_printf("STOP: CPU is parked; halt before downloading another ELF.\r\n");
     for (;;) {
         __asm__ volatile ("wfi");

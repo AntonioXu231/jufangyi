@@ -4,6 +4,19 @@
 
 ## [Unreleased]
 
+### 2026-09-21
+
+- **已上板验证**：A 档案（事件自动快照）冒烟测试通过 —— 修订版 `sw/pd_snapshot_poll.c` 输出
+  `SNAPSHOT_POLL_PASS`，覆盖契约地址、首个快照描述符、`err` 清零语义、四槽轮转与槽满拒绝。
+  `DDR_STATUS[5]` 一次性启动瞬态口径再次确认（`FREEZE_RESUME` 后不再复现）。
+  数据内容未做逐样本校验，`SNAP_TRIG_DROPS` 未被激励 —— 详见
+  `变更记录/v1.6.0-p1-resource-reduction.md` 的「2026-09-21 补充」。
+- **未验证**：新增 `sw/pd_feature_dma_s2mm_smoke.c`（B 档案 S2MM 接收冒烟，仅完成与 RTL 的静态一致性核验）、
+  `sw/pd_acquisition_service.c`、`sw/pd_capture_service.c`（各附使用说明）。
+- **方案未执行**：新增《时序收敛与err修法实施方案_20260921.md》；`WNS=-0.054 ns` 仍未收敛，
+  发布门禁未通过。
+- 新增《PS_AXI_DMA_S2MM逐行注释_20260921.md》（含事件包位域与 RTL 的核验表）。
+
 ### 计划中
 
 - 暴露 `o_last_btt` / `o_sts_tdata`，或把已存在但未接线的 `dbg_ddr` 引入 AXI4-Lite 读回，以区分 `ring_err` 与 `ring_ovf`。
