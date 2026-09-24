@@ -3,6 +3,9 @@ param(
     [string]$Kind = 'SNAP',
     [ValidateRange(0, 15)]
     [int]$Index = 0,
+    # -1 retains the legacy index mode; a non-negative value uses SEQ mode.
+    [ValidateRange(-1, 4294967295)]
+    [long]$Sequence = -1,
     [string]$OutFile = '.\pd_record.bin',
     [string]$HostIp = '192.168.1.10',
     [ValidateRange(1, 65535)]
@@ -67,11 +70,19 @@ $stream = $client.GetStream()
 
 try {
     $banner = Read-AsciiLine $stream
-    if ($banner -notmatch '^PD_ACQ TCP V2 READY') {
-        throw "Target is not TCP service V2: $banner"
+    if ($banner -notmatch '^PD_ACQ TCP (?:V2|PS-1) READY') {
+        throw "Target is not a supported PD acquisition TCP service: $banner"
     }
 
-    Send-Line $stream "$Kind $Index"
+    if ($Sequence -ge 0) {
+        $selector = "SEQ $Sequence"
+        $recordName = "$Kind SEQ $Sequence"
+    } else {
+        $selector = "$Index"
+        $recordName = "$Kind $Index"
+    }
+
+    Send-Line $stream "$Kind $selector"
     $metadata = Read-AsciiLine $stream
     if ($metadata -match '^ERR') { throw "Target rejected record: $metadata" }
     if ($metadata -notmatch '\bbytes=(\d+)\b') {
@@ -79,6 +90,10 @@ try {
     }
     [int]$total = $Matches[1]
     if ($total -le 0) { throw 'Record has zero length.' }
+    if ($metadata -notmatch '\bindex=(\d+)\b') {
+        throw "Cannot obtain resolved archive index from: $metadata"
+    }
+    [int]$resolvedIndex = $Matches[1]
 
     $outDir = Split-Path -Parent $OutFile
     if ($outDir) { [System.IO.Directory]::CreateDirectory($outDir) | Out-Null }
@@ -87,9 +102,9 @@ try {
     try {
         for ([int]$offset = 0; $offset -lt $total; $offset += $ChunkBytes) {
             [int]$want = [Math]::Min($ChunkBytes, $total - $offset)
-            Send-Line $stream "GET $Kind $Index $offset $want"
+            Send-Line $stream "GET $Kind $selector $offset $want"
             $header = Read-AsciiLine $stream
-            $pattern = "^DATA V2 kind=$Kind index=$Index offset=$offset bytes=(\d+) crc32=([0-9A-Fa-f]{8})$"
+            $pattern = "^DATA V2 kind=$Kind index=$resolvedIndex offset=$offset bytes=(\d+) crc32=([0-9A-Fa-f]{8})$"
             if ($header -notmatch $pattern) { throw "Unexpected DATA header: $header" }
             [int]$actual = $Matches[1]
             [uint32]$expectedCrc = [Convert]::ToUInt32($Matches[2], 16)
@@ -100,16 +115,16 @@ try {
                 throw ('CRC32 mismatch at offset {0}: expected {1:X8}, got {2:X8}' -f $offset, $expectedCrc, $actualCrc)
             }
             $file.Write($chunk, 0, $chunk.Length)
-            Write-Progress -Activity "Downloading $Kind $Index" -Status "$($offset + $actual) / $total bytes" -PercentComplete (100.0 * ($offset + $actual) / $total)
+            Write-Progress -Activity "Downloading $recordName" -Status "$($offset + $actual) / $total bytes" -PercentComplete (100.0 * ($offset + $actual) / $total)
         }
     }
     finally {
         $file.Dispose()
-        Write-Progress -Activity "Downloading $Kind $Index" -Completed
+        Write-Progress -Activity "Downloading $recordName" -Completed
     }
 
     $sidecar = [ordered]@{
-        kind = $Kind; index = $Index; bytes = $total; source_metadata = $metadata
+        kind = $Kind; index = $resolvedIndex; sequence = $Sequence; bytes = $total; source_metadata = $metadata
         downloaded_utc = [DateTime]::UtcNow.ToString('o'); target = "$HostIp`:$Port"
     } | ConvertTo-Json
     [System.IO.File]::WriteAllText("$OutFile.json", $sidecar, [System.Text.Encoding]::UTF8)

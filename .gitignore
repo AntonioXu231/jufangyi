@@ -47,3 +47,7 @@
 xsim.dir/
 webtalk*.xml
 usage_statistics_webtalk.*
+
+# Qt host local settings and build outputs
+**/sw/host_qt6/build*/
+**/sw/host_qt6/.qtcreator/
