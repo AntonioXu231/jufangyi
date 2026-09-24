@@ -356,7 +356,12 @@ module pd_axil_regs #(
                 r_ctrl[c]      <= 32'h0000_0001;   // 默认使能
                 r_cfg0[c]      <= 32'h0400_0000;   // N = 1024, mode = ABSMAX
                 r_phase_inc[c] <= `PD_PH_INC_1024; // 2^32 / 1024
-                r_thresh[c]    <= 32'd40;          // 门限 40 LSB
+                // The DDS background is +/-32 codes on CH2.  A 40-code
+                // default makes nearly every phase window a false event and
+                // paints a continuous ellipse arc.  The synthetic pulse
+                // templates are hundreds of codes, so 80 rejects the
+                // background while retaining the intended pulses.
+                r_thresh[c]    <= 32'd80;          // 门限 80 LSB (DDS-safe)
                 r_scale[c]     <= 32'd256;         // Q8.8 -> 1.0
                 r_upeak[c]     <= 32'd2560;        // Q8.8 -> 10.0
                 r_deadtime[c]  <= 32'd100;         // 5 us @20MSPS

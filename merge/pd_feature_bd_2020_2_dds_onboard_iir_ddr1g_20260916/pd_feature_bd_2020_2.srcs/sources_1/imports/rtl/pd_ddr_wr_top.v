@@ -49,6 +49,11 @@ module pd_ddr_wr_top #(
     // ================= 周期边界（来自 AC/DC 周期管理）=================
     input  wire                      cycle_start,  // 1 拍脉冲
 
+    // ================= Path B feature event (clk domain) =================
+    // A bit is asserted when the corresponding feature event has entered its
+    // local FIFO.  It is used only for optional automatic snapshot triggering.
+    input  wire [CH_NUM-1:0]         i_event_accept,
+
     // ================= AXI4-Lite 从机（PS M_AXI_GP0）=================
     input  wire [15:0]               s_axi_awaddr,
     input  wire                      s_axi_awvalid,
@@ -178,12 +183,17 @@ module pd_ddr_wr_top #(
     // --- 控制 / 状态 ---
     wire                 acq_en, sw_rst;
     wire [31:0]          snap_base, snap_size;
+    wire                 sw_freeze_trig, auto_freeze_trig;
     wire                 freeze_trig, freeze_resume, snap_start;
     wire                 freeze_done;
     wire [31:0]          freeze_base, freeze_len;
     wire                 copy_busy, copy_done, copy_err;
     wire [31:0]          copy_chunk_cnt, copy_bytes_done;
     wire                 auto_snap_en;
+    wire                 event_trig_en, event_trig_stat_clear;
+    wire [3:0]           event_trig_mask;
+    wire                 event_trig_armed, event_trig_slot_full_drop;
+    wire [31:0]          event_trig_drop_count;
     wire [3:0]           slot_lock_cmd, slot_release_cmd;
     wire                 slot_status_clear;
     wire [3:0]           slot_valid, slot_busy, slot_locked;
@@ -194,6 +204,31 @@ module pd_ddr_wr_top #(
     wire [31:0]          slot_snapshot_seq, slot_drop_count;
     wire [31:0]          slot0_len, slot1_len, slot2_len, slot3_len;
     wire [31:0]          slot0_seq, slot1_seq, slot2_seq, slot3_seq;
+
+    // Both trigger sources are in the clk domain.  Software has priority
+    // inside pd_snapshot_trigger; OR here preserves the legacy W1P behavior.
+    assign freeze_trig = sw_freeze_trig | auto_freeze_trig;
+
+    pd_snapshot_trigger #(
+        .CH_NUM(CH_NUM)
+    ) u_snapshot_trigger (
+        .clk                    (clk),
+        .rst_n                  (rst_n),
+        .i_event_accept         (i_event_accept),
+        // Event-triggered freezing is meaningful only when the automatic
+        // four-slot copy path is enabled as well.  This prevents an enabled
+        // trigger from accidentally entering the legacy manual-copy mode.
+        .i_enable               (event_trig_en & auto_snap_en),
+        .i_channel_mask         (event_trig_mask),
+        .i_sw_freeze_trig       (sw_freeze_trig),
+        .i_freeze_resume        (freeze_resume),
+        .i_slot_full            (slot_full),
+        .i_status_clear         (event_trig_stat_clear),
+        .o_auto_freeze_trig     (auto_freeze_trig),
+        .o_armed                (event_trig_armed),
+        .o_slot_full_drop       (event_trig_slot_full_drop),
+        .o_slot_full_drop_count (event_trig_drop_count)
+    );
 
     // =========================================================================
     // 1) 复位处理
@@ -687,10 +722,13 @@ module pd_ddr_wr_top #(
         .o_sw_rst       (sw_rst),
         .o_snap_base    (snap_base),
         .o_snap_size    (snap_size),
-        .o_freeze_trig  (freeze_trig),
+        .o_freeze_trig  (sw_freeze_trig),
         .o_freeze_resume(freeze_resume),
         .o_snap_start   (snap_start),
         .o_auto_snap_en (auto_snap_en),
+        .o_event_trig_en(event_trig_en),
+        .o_event_trig_mask(event_trig_mask),
+        .o_event_trig_stat_clear(event_trig_stat_clear),
         .o_slot_lock    (slot_lock_cmd),
         .o_slot_release (slot_release_cmd),
         .o_slot_status_clear(slot_status_clear),
@@ -724,6 +762,9 @@ module pd_ddr_wr_top #(
         .i_slot_last    (slot_last),
         .i_slot_snapshot_seq(slot_snapshot_seq),
         .i_slot_drop_count(slot_drop_count),
+        .i_event_trig_armed(event_trig_armed),
+        .i_event_trig_slot_full_drop(event_trig_slot_full_drop),
+        .i_event_trig_drop_count(event_trig_drop_count),
         .i_slot0_len    (slot0_len), .i_slot1_len(slot1_len),
         .i_slot2_len    (slot2_len), .i_slot3_len(slot3_len),
         .i_slot0_seq    (slot0_seq), .i_slot1_seq(slot1_seq),

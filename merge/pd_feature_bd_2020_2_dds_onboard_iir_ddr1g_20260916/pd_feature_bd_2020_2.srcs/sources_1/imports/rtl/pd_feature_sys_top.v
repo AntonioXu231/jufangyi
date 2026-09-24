@@ -104,6 +104,11 @@ module pd_feature_sys_top #(
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis TREADY" *)
     input  wire          m_axis_tready,
 
+    // Internal PL event-accept indication for the DDR auto-snapshot path.
+    // This is not an AXI interface and does not alter the AXI-Lite/AXI-Stream
+    // interface contract of pd_feature_sys_top.
+    output wire [NUM_CH-1:0] o_event_accept,
+
     // ================= 中断 =================
     (* X_INTERFACE_PARAMETER = "XIL_INTERFACENAME IRQ, SENSITIVITY LEVEL_HIGH" *)
     (* X_INTERFACE_INFO = "xilinx.com:signal:interrupt:1.0 irq INTERRUPT" *)
@@ -197,6 +202,8 @@ module pd_feature_sys_top #(
         .m_axis_tvalid (m_axis_tvalid),
         .m_axis_tlast  (m_axis_tlast),
         .m_axis_tready (m_axis_tready),
+
+        .o_event_accept(o_event_accept),
 
         .irq           (irq)
     );
