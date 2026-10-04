@@ -15,7 +15,8 @@ class QTimer;
  * start_scope，以及 TCP_API_v10 冻结说明）：
  *   - 必须先处于采集运行态（state != 0），SCOPE 才被接受；
  *   - SCOPE ON [samples]，samples ∈ [256, 2048] 且为 4 的倍数，默认 1024；
- *   - SCOPE NEXT 每次只返回一帧，帧头 "SCOPE V1 seq= samples= bytes= fs= crc32="
+ *   - SCOPE NEXT 每次只返回一帧，帧头 "SCOPE V1 seq= samples= bytes= fs= crc32="；
+ *     SCOPE EVENT SEQ n 返回最新完整快照中按 PL 相位对齐的 "SCOPE V2" 事件中心帧；
  *     后紧跟 bytes 个二进制字节，bytes = samples×6；
  *   - 一次只能有一个传输在途，第二个 NEXT 会回 "ERR SCOPE transfer is still active"；
  *   - 帧内容是 DDR 环上"距离写指针 24 KiB 之前"的一个窗口，不是归档快照。
@@ -23,7 +24,8 @@ class QTimer;
  * 本类负责：自动编排（必要时先 START 0）、帧节奏控制、在途互斥、CRC 校验结果
  * 汇总、超时看门狗与重试、按 seq 检测跳帧、以及触发判定。
  *
- * 明确不做的事：不修改任何 PL/PS 代码，不改变 DDR 或快照格式，不发非 SCOPE 命令。
+ * 事件中心帧只增加 PS TCP 读取路径，不改变 PL 事件/DDR 快照格式；
+ * 它与连续 SCOPE 帧共享同一 TCP 二进制互斥。
  */
 class ScopeStream final : public QObject
 {
@@ -89,6 +91,9 @@ public:
     void setSuspendRequests(bool suspended);
     bool isSuspended() const { return m_suspendRequests; }
     bool isFrameInFlight() const { return m_frameInFlight; }
+    /* Queue a waveform request centred on a retained PL event sequence.  The
+       request is serialized behind any live/SCOPE transfer already in flight. */
+    void requestEventFrame(quint32 eventSequence);
 
     State state() const { return m_state; }
     bool isRunning() const;
@@ -106,6 +111,8 @@ public slots:
 
 signals:
     void liveFrame(const pdsample::WaveformFrame &frame, int triggerIndex, bool triggerValid);
+    void eventFrame(const pdsample::WaveformFrame &frame, quint32 eventSequence);
+    void eventFrameFailed(quint32 eventSequence, const QString &reason);
     void rollFrame(const pdsample::WaveformFrame &frame);
     void stateChanged(ScopeStream::State state, const QString &message);
     void statisticsChanged();
@@ -124,6 +131,7 @@ private:
     void send(const QString &command);
     void setState(State state, const QString &message);
     void requestFrame();
+    void requestPendingEventFrame();
     void flushPendingScopeOff();
     void setFrameInFlight(bool value);
     void scheduleFrameRequest();
@@ -149,6 +157,10 @@ private:
        板端同一时刻只接受一个传输，二进制期间发文本命令会被客户端挡掉。 */
     bool m_scopeOffPending = false;
     bool m_stopRequested = false;
+    bool m_eventRequestPending = false;
+    bool m_eventFrameInFlight = false;
+    quint32 m_pendingEventSequence = 0U;
+    quint32 m_eventSequenceInFlight = 0U;
     int m_consecutiveTimeouts = 0;
     int m_transportRetries = 0;
 

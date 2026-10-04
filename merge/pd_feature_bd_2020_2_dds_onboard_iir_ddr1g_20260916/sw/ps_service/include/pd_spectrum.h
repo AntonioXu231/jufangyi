@@ -38,6 +38,14 @@ typedef struct {
 int pd_spectrum_analyze(const void *raw, u32 bytes, u32 start_sample,
                         u32 sample_rate_hz, pd_spectrum_result_t *result);
 
+/* Analyze one channel and optionally return its 513 single-sided magnitudes.
+ * Magnitudes use the same approximate peak-code scale as amplitude_code in
+ * pd_spectrum_analyze(); bin 0 is zero because the DC mean is removed. */
+int pd_spectrum_analyze_channel(const void *raw, u32 bytes, u32 start_sample,
+                                u32 sample_rate_hz, u32 channel,
+                                u16 bins[PD_FFT_POINTS / 2U + 1U],
+                                pd_spectrum_channel_t *result);
+
 /* Select one common four-channel FFT window around the strongest raw excursion. */
 int pd_spectrum_find_peak_window(const void *raw, u32 bytes,
                                  pd_spectrum_window_t *window);

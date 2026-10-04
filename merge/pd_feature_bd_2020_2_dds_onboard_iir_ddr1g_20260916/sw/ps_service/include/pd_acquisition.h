@@ -5,7 +5,9 @@
 #include "xil_types.h"
 
 /* PS-owned circular archive geometry.  Front ends and analysis modules use it. */
-#define PD_EVENT_ARCHIVE_COUNT 16U
+/* 2048 x 64 KiB = 128 MiB; at the observed ~64 packets/s this retains about
+ * 32 seconds, leaving headroom beyond the host's 15-second display window. */
+#define PD_EVENT_ARCHIVE_COUNT 2048U
 #define PD_SNAP_ARCHIVE_COUNT  4U
 
 typedef struct {

@@ -108,6 +108,7 @@ void ScopeWidget::setStaticTrace(const pdsample::WaveformFrame &frame, const QSt
 void ScopeWidget::setLiveFrame(const pdsample::WaveformFrame &frame, int triggerIndex,
                               bool triggerValid, double triggerLevel, int triggerChannel)
 {
+    if (m_eventHoldUntilMs > QDateTime::currentMSecsSinceEpoch()) return;
     m_mode = Mode::Live;
     m_frame = frame;
     m_sampleRateHz = frame.sampleRateHz;
@@ -134,6 +135,33 @@ void ScopeWidget::setLiveFrame(const pdsample::WaveformFrame &frame, int trigger
     bumpDataVersion();
     requestRepaint();
     emit viewChanged();
+}
+
+void ScopeWidget::setEventFrame(const pdsample::WaveformFrame &frame, const QString &label,
+                                int holdMilliseconds)
+{
+    m_mode = Mode::Live;
+    m_frame = frame;
+    m_sampleRateHz = frame.sampleRateHz;
+    m_triggerIndex = -1;
+    m_triggerValid = false;
+    m_label = label;
+    m_eventHoldUntilMs = QDateTime::currentMSecsSinceEpoch() + qMax(0, holdMilliseconds);
+    if (!m_viewInitialised || !m_userAdjustedView) {
+        m_viewStart = 0.0;
+        m_viewSpan = qMax(16, frame.sampleCount);
+        m_viewInitialised = true;
+    }
+    if (m_viewStart + m_viewSpan > frame.sampleCount)
+        m_viewStart = qMax(0.0, frame.sampleCount - m_viewSpan);
+    bumpDataVersion();
+    requestRepaint();
+    emit viewChanged();
+}
+
+bool ScopeWidget::eventHoldActive() const
+{
+    return m_eventHoldUntilMs > QDateTime::currentMSecsSinceEpoch();
 }
 
 void ScopeWidget::appendRollFrame(const pdsample::WaveformFrame &frame)

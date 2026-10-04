@@ -199,7 +199,8 @@ void PdTcpClient::processTextLines()
             emit textLine(line);
             return;
         }
-        if (line.startsWith(QStringLiteral("SCOPE V1 "))) {
+        if (line.startsWith(QStringLiteral("SCOPE V1 ")) ||
+            line.startsWith(QStringLiteral("SCOPE V2 "))) {
             const QRegularExpression samplesExpr(QStringLiteral("\\bsamples=(\\d+)"));
             const QRegularExpression bytesExpr(QStringLiteral("\\bbytes=(\\d+)"));
             const QRegularExpression rateExpr(QStringLiteral("\\bfs=(\\d+)"));

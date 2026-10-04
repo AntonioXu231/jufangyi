@@ -38,6 +38,11 @@ public:
     void setStaticTrace(const pdsample::WaveformFrame &frame, const QString &label);
     void setLiveFrame(const pdsample::WaveformFrame &frame, int triggerIndex,
                       bool triggerValid, double triggerLevel, int triggerChannel);
+    /* 显示与 PL 特征事件对应的短波形窗口，并保持一小段时间，避免
+       连续 SCOPE 帧在几十毫秒内把局放脉冲冲掉。 */
+    void setEventFrame(const pdsample::WaveformFrame &frame, const QString &label,
+                       int holdMilliseconds = 500);
+    bool eventHoldActive() const;
     void appendRollFrame(const pdsample::WaveformFrame &frame);
     void clearData();
 
@@ -223,4 +228,5 @@ private:
     QPoint m_lastMouse;
     double m_lastFrameIntervalSec = 0.0;
     qint64 m_lastArrivalMs = 0;
+    qint64 m_eventHoldUntilMs = 0;
 };

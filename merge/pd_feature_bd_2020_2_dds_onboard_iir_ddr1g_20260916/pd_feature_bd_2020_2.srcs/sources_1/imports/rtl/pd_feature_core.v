@@ -27,7 +27,8 @@ module pd_feature_core #(
     parameter integer ADC_W      = `PD_ADC_W,
     parameter integer PH_W       = `PD_PH_W,
     parameter integer TS_W       = `PD_TS_W,
-    parameter integer EV_W       = `PD_EV_W
+    parameter integer EV_W       = `PD_EV_W,
+    parameter integer SAMPLE_HZ  = 26000000
 )(
     input  wire                 clk,
     input  wire                 rst_n,
@@ -38,6 +39,10 @@ module pd_feature_core #(
 
     // ---------------- 同步输入 (板级整形后的 3.3V 方波) ----------------
     input  wire                 sync_in,
+    input  wire                 pm_cycle_start,
+    input  wire [31:0]          pm_period,
+    input  wire                 pm_freq_ok,
+    input  wire                 pm_sync_lost,
 
     // ---------------- 配置 (来自 AXI-Lite 寄存器) ----------------
     input  wire                 cfg_enable,      // 通道使能
@@ -87,6 +92,8 @@ module pd_feature_core #(
     output reg  [63:0]          st_sn_sum_abs_q, // 快照: Σ|q|  -> I = Σ|q| / T
     output reg  [63:0]          st_sn_sum_qu,    // 快照: Σq·u  -> P = Σq·u / T
     output reg  [31:0]          st_live_cycles,  // 自上次清零以来累积的周期数
+    output wire [31:0]          st_cycle_idx,
+    output reg  [15:0]          st_ad_max, st_ad_min,
     output reg                  st_meas_done,    // 快照完成脉冲 (1 clk)
     output reg                  st_overflow,      // 窗口丢失标志 (软复位清除)
     output reg [6*32-1:0]        st_pos_cnt, st_neg_cnt,
@@ -155,20 +162,9 @@ module pd_feature_core #(
     end
 
     // =========================================================================
-    // 1. 同步边沿检测
+    // 1. 窗口采集状态
     // =========================================================================
-    reg [2:0] sync_sr;
-    always @(posedge clk or negedge rst_n)
-        if (!rst_n) sync_sr <= 3'b000;
-        else        sync_sr <= {sync_sr[1:0], sync_in};
-
-    wire sync_rise = (sync_sr[2:1] == 2'b01);      // 上升沿 = 工频相位 0
-
-    // =========================================================================
-    // 2. 窗口采集状态
-    // =========================================================================
-    reg         [31:0] m_cnt;         // 本同步周期内已采样本数
-    reg         [31:0] m_period;      // 上一周期实测样本数 M
+    reg         [31:0] m_period;      // 周期管理器给出的周期样本数 M
     reg         [31:0] ph_acc;        // Bresenham 相位累加器
     reg [PH_W-1:0]     ph_idx;        // 当前相位窗索引 0..N-1
     reg         [31:0] u_phase;       // u 相位累加器
@@ -195,6 +191,7 @@ module pd_feature_core #(
     // 做直流放电时域曲线绘图": 每帧取 [AD_MIN, AD_MAX] 竖线段, 逐帧连成包络。
     // (声明位置需早于下方窗口收尾块, 否则综合报"used before declaration")
     reg signed [ADC_W-1:0] frame_ad_max_acc, frame_ad_min_acc;
+    reg signed [ADC_W-1:0] meas_ad_max_acc, meas_ad_min_acc;
 
     reg                    win_pending, cyc_pending;
     reg                    armed;            // 已收到第一个有效同步沿
@@ -229,8 +226,7 @@ module pd_feature_core #(
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            m_cnt        <= 32'd0;
-            m_period     <= `PD_M_DEFAULT;
+            m_period     <= SAMPLE_HZ / 50;
             ph_acc       <= 32'd0;
             ph_idx       <= {PH_W{1'b0}};
             u_phase      <= 32'd0;
@@ -246,25 +242,23 @@ module pd_feature_core #(
             armed        <= 1'b0;
             arm_clr      <= 1'b0;
             st_sync_locked <= 1'b0;
-            st_sync_period <= `PD_M_DEFAULT;
+            st_sync_period <= SAMPLE_HZ / 50;
         end else begin
             win_close <= 1'b0;
             cyc_end   <= 1'b0;
             arm_clr   <= 1'b0;
             win_lost  <= 1'b0;   // 默认清零, 仅在 close_window 拍被 win_pending 覆盖
 
-            // 同步周期测量独立于通道使能, 保证 f_sync 始终可读
-            if (adc_dv) m_cnt <= m_cnt + 32'd1;
+            if (pm_sync_lost)
+                st_sync_locked <= 1'b0;
 
-            if (sync_rise) begin
-                // ---- 同步上升沿 ----
-                // m_cnt 过短说明这不是一个完整的工频周期(例如复位释放瞬间
-                // sync 已为高而误检出的上升沿), 此时只复位相位、丢弃数据,
-                // 不产生周期统计包, 避免污染 n / I / P。
-                if (m_cnt > 32'd1024) begin
-                    m_period       <= m_cnt;
-                    st_sync_period <= m_cnt;
-                    st_sync_locked <= 1'b1;
+            if (pm_cycle_start) begin
+                // Period manager supplies a measured AC period, a nominal
+                // fallback after sync loss, or a fixed 20 ms DC window.
+                if (pm_period > 32'd1024) begin
+                    m_period       <= pm_period;
+                    st_sync_period <= pm_period;
+                    st_sync_locked <= pm_freq_ok && !pm_sync_lost;
 
                     if (armed) begin
                         close_window;               // 收尾上一周期
@@ -278,8 +272,6 @@ module pd_feature_core #(
                 ph_acc  <= {{(32-PH_W){1'b0}}, cfg_phase_win};
                 ph_idx  <= {PH_W{1'b0}};
                 u_phase <= cfg_phase_inc;
-                m_cnt   <= adc_dv ? 32'd1 : 32'd0;
-
                 if (adc_dv && cfg_enable) begin
                     g_sample_cnt <= g_sample_cnt + 32'd1;
                     w_max <= sdata; w_min <= sdata; w_cnt <= 32'd1; w_valid <= 1'b1;
@@ -612,7 +604,9 @@ module pd_feature_core #(
             pos_thr_r <= {6{16'd40}}; neg_thr_r <= {6{16'd40}};   // 与 axil 复位默认值一致
             apply_pending <= 1'b0;
             frame_npos_acc <= 0; frame_nneg_acc <= 0; frame_ad_max_acc <= SMIN; frame_ad_min_acc <= SMAX;
+            meas_ad_max_acc <= SMIN; meas_ad_min_acc <= SMAX;
             st_frame_n_pos <= 0; st_frame_n_neg <= 0; st_frame_ad_max <= 0; st_frame_ad_min <= 0; st_frame_id <= 0; st_frame_stat <= 0;
+            st_ad_max <= 16'd0; st_ad_min <= 16'd0;
             st_pos_cnt <= 0; st_neg_cnt <= 0;
             stat_q0_c <= {ADC_W{1'b0}}; stat_q1_c <= {ADC_W{1'b0}};
             stat_q0_pol <= 1'b0; stat_q1_pol <= 1'b0;
@@ -881,6 +875,12 @@ module pd_feature_core #(
 
                         if (meas_win_hit) begin
                             st_meas_done <= 1'b1;
+                            st_ad_max <= (meas_ad_max_acc == SMIN) ? 16'd0
+                                       : {{16-ADC_W{meas_ad_max_acc[ADC_W-1]}}, meas_ad_max_acc};
+                            st_ad_min <= (meas_ad_min_acc == SMAX) ? 16'd0
+                                       : {{16-ADC_W{meas_ad_min_acc[ADC_W-1]}}, meas_ad_min_acc};
+                            meas_ad_max_acc <= SMIN;
+                            meas_ad_min_acc <= SMAX;
                             if (cfg_auto_clear) begin
                                 acc_n          <= 32'd0;
                                 acc_qmax       <= 32'd0;
@@ -910,8 +910,13 @@ module pd_feature_core #(
             if (win_close) begin
                 if ($signed(wc_max) > frame_ad_max_acc) frame_ad_max_acc <= wc_max;
                 if ($signed(wc_min) < frame_ad_min_acc) frame_ad_min_acc <= wc_min;
+                if ($signed(wc_max) > meas_ad_max_acc) meas_ad_max_acc <= wc_max;
+                if ($signed(wc_min) < meas_ad_min_acc) meas_ad_min_acc <= wc_min;
             end
         end
     end
+
+    // Same sequence source as the cycle statistics packet (evc).
+    assign st_cycle_idx = cycle_idx;
 
 endmodule

@@ -26,7 +26,7 @@ TCP 前端新增以下不改动 PL 的运行时命令：
 
 - `CONFIG`：返回 API 版本、默认采集包数、事件/快照归档容量及 `GET` 单次传输上限。
 - `SET LIMIT n`：仅空闲时设置后续无参数 `START` 的默认包数；`n=0` 表示连续采集，配置仅在当前上电会话内保持。
-- `SCOPE ON [samples]` / `SCOPE NEXT` / `SCOPE OFF`：实时示波器协议。PS 从 PL 原始 DDR 环形缓冲中读取一个最新窗口（默认 1024 个四通道 48-bit 样本），以 `SCOPE V1` 二进制帧推送给 Qt；不是快照归档下载。仅在采集运行时允许 `NEXT`，`samples` 必须为 256..2048 且是 4 的倍数。
+- `SCOPE ON [samples]` / `SCOPE NEXT` / `SCOPE FFT CHANNEL n`（`n=0..3`）/ `SCOPE EVENT SEQ n [samples]` / `SCOPE OFF`：实时示波器协议。PS 从 PL 原始 DDR 环形缓冲中读取一个最新窗口（默认 1024 个四通道 48-bit 样本），以 `SCOPE V1` 二进制帧推送给 Qt；`SCOPE FFT CHANNEL n` 对最近一次 `SCOPE NEXT` 的同一帧在 PS 上去直流、加 Hann 窗并执行 1024 点固定点 FFT，返回 513 个单边幅值码（u16 little-endian，CRC32 覆盖负载）及主峰/频率/帧序号；Qt 仅绘图，不做 FFT。为兼容旧客户端，简写 `SCOPE FFT n` 仍可用。`SCOPE EVENT SEQ` 则根据 PL 事件包的相位字段，在最新完整快照中提取事件中心窗口，以 `SCOPE V2` 推送给 Qt，用于波形与椭圆脉冲联动显示。快照与事件允许相差数个周期，帧头会公开 `snap_seq/event_seq/start/center/phase` 关联信息。仅在采集运行时允许这些命令，`samples` 必须为 256..2048 且是 4 的倍数；实时 FFT 要求 `SCOPE ON 1024`，以确保频谱覆盖与显示波形完全相同的整帧。
 - `START`：不带参数时采用 `SET LIMIT` 保存的默认值；`START n` 始终以显式 `n` 为准。
 - `RECOVER`：仅 `FAULT` 状态有效。服务会关闭新触发、等待正在进行的 PL 拷贝结束、逐槽锁定并释放仍未归档的硬件快照、清除槽状态并复位 S2MM DMA。已归档到 PS DDR 的事件与快照不受影响；回复中的 `discarded_slots` 是明确丢弃的硬件槽数。
 - `CATALOG`：返回当前 PS DDR 环形归档的保留序号窗口，区间是半开区间 `[first,next)`。
@@ -247,3 +247,13 @@ Set-ExecutionPolicy -Scope Process Bypass
 ```
 
 如需在测试后清理 PS 元数据（原始 PL DDR 不受影响），追加 `-ClearAtEnd`。运行前必须下载 `CONFIG api=11` 的 ELF。
+
+## API 16：完整 PL 事件包、PS 实时 FFT 与整周期包络（当前版本）
+
+本节覆盖上文历史 API 说明中关于 `SCOPE PEAKS` 抽取峰值或仅有 16 个事件归档槽的表述。当前基准代码把事件归档扩为 2048 × 64 KiB（DDR `0x27000000` 至 `0x2EFFFFFF`）；快照归档止于 `0x26FFFFFF`，两者不重叠。`SCOPE PEAKS` 返回 `PEAKS V2`，传送一个归档包的全部 64-bit 字，包括每个峰值和周期字，CRC32 覆盖完整负载，不进行 256 峰值抽取。归档游标超出保留窗口时，回复中的 `gap` 为本次跳过包数，`skipped` 为本会话累计跳过包数；坏包也计入 `skipped`。新增的 `SCOPE FFT channel` 对最近 `SCOPE NEXT` 帧执行 PS 端 1024 点固定点 FFT，只返回所选通道的 513 点幅值谱；响应 `SCOPE_FFT V1` 中 `seq` 必须与该波形帧 `seq` 相同，二进制负载为 513 个 u16 little-endian 幅值码并由 CRC32 校验。
+
+新增 `SCOPE ENVELOPE` 用于上位机整周期示波与相位图：它查找最新归档快照，要求负载为 520,000 个采样时刻 × 每时刻 6 字节（四路 12-bit ADC 打包），并从 DDR 逐样本归约为 1,024 个相位列。每列、每通道输出 `min:s16, max:s16` 两个 little-endian 16-bit 值，列序为相位递增、列内通道 0..3，固定负载 16,384 字节；头格式为 `SCOPE_ENV V1 seq=... snap_seq=... samples=520000 bins=1024 bytes=16384 fs=26000000 lock=... phase=cycle_start crc32=...`。CRC32 覆盖完整 16,384 字节。若无完整快照，返回 `SCOPE_ENV NONE reason=not_ready`；处理期间快照被四槽环覆盖，则返回 `SCOPE_ENV SKIP reason=snapshot_overwritten`。归约按最多 32,768 个采样/轮询步分片，避免在 lwIP 命令回调中一次性长时间占用 CPU。快照的相位列成立条件是 PL 环形缓存确实以 `cycle_start` 周期边界冻结；`lock` 位掩码表示各通道当前 PL 锁相状态，Qt 端必须结合该掩码判定相位是否有效。
+
+Vitis 应用至少同步 `include/pd_acquisition.h`、`include/pd_spectrum.h`、`src/pd_spectrum.c`、`tcp/pd_tcp_service.c`，并保持 `include/pd_hw_map.h` 与基准目录一致。全周期归约能力在 `tcp/pd_tcp_service.c` 中；若应用的其余模块已与本目录版本一致，本次只需替换该文件。只更新 Qt 而不更新板端 ELF 不会得到完整事件流、PS 实时 FFT 或整周期包络。构建和下载由使用者在 Vitis 执行；本次修改未重新运行硬件验收。
+
+验收时先用独立 TCP 客户端发送 `CONFIG`，应包含 `api=16 event_slots=2048 scope_fft=ps_q15_1024x1_bins513 scope_env=cycle520000_bins1024_ch4_minmax16`。随后 `START 0`、`SCOPE ON 1024`、`SCOPE ENVELOPE`；必须完整读取 ASCII 头及其声明的 16,384 字节二进制负载，再校验 CRC。连续多次请求时，`snap_seq` 应在产生新快照后递增；如果出现 `NONE`，表示尚无完整周期快照，如果出现 `SKIP`，表示处理期间四槽归档被覆盖。之后仍可用 `SCOPE NEXT` + `SCOPE FFT CHANNEL 0` 检查短窗 PS FFT，及用 `SCOPE PEAKS` 检查完整 PL 事件包。务必按字节数读取二进制，不要在负载中继续逐行读取。实际刷新频率与事件缺口须在目标硬件实测；若 `gap`、`skipped` 或 Qt 序号缺口增长，必须报告事件损失，不能把归档覆盖数 `ev_ovw` 误当成上位机丢包数。

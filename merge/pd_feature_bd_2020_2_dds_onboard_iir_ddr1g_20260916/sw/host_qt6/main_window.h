@@ -124,6 +124,8 @@ private:
     void enqueueLog(const QString &prefix, const QString &text);
     /* 把界面上脉冲相关的设置读进 m_pulseSettings 并推给各控件与工作线程。 */
     void applyPulseSettings();
+    /* 最终用户阈值在 Qt 端执行，PL 事件只作为候选输入。 */
+    bool passesHostEventThreshold(const pdsample::PeakEvent &event) const;
     /* 用 evt_seq 统计每通道丢帧（此前完全没用上，是免费的完整性检查）。 */
     void accountEventSequences(const QVector<pdsample::PeakEvent> &events);
     void updatePulseStatistics();
@@ -243,6 +245,9 @@ private:
     quint64 m_evtSeqGaps = 0;
     quint64 m_evtSeqTotal = 0;
     quint64 m_unrecognisedEvents = 0;
+    quint64 m_hostEventSeen = 0;
+    quint64 m_hostEventAccepted = 0;
+    quint64 m_hostEventRejected = 0;
 
     /* ---- 日志合并 ---- */
     QTimer *m_logFlushTimer = nullptr;

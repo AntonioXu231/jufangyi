@@ -13,7 +13,7 @@
 //
 // 通道寄存器 (偏移):
 //   0x00 CTRL       RW  [0]enable [1]sw_rst(W1P) [2]auto_clear [3]ev_all
-//                       [4]prpd_max [5]prpd_clear(W1P)
+//                       [4]prpd_max [5]prpd_clear(W1P) [6]dc_mode
 //   0x04 CFG0       RW  [1:0]mode  [31:16]phase_win(N, <=2048)
 //   0x08 PHASE_INC  RW  2^32/N (u 相位累加步长)
 //   0x0C THRESH     RW  [11:0] 门限 (ADC 码)
@@ -22,6 +22,7 @@
 //   0x18 DEADTIME   RW  [15:0] 死区 (ADC 样本数, 0=禁用)
 //   0x1C MEAS_CYC   RW  [15:0] 测量窗口长度 (同步周期数, 0=不自动快照)
 //   0x20 STATUS     RO  [0]sync_locked [1]meas_done_sticky [2]overflow
+//                                                       [3]sync_lost [4]OTR
 //   0x24 SYNC_PER   RO  实测同步周期 (ADC 样本数 M); f_sync = 20e6 / M
 //   0x28 CNT_N      RO  放电脉冲计数 n
 //   0x2C Q_MAX      RO  最大视在电荷量 Q (pC)
@@ -30,8 +31,8 @@
 //   0x38 SUM_QU_LO  RO  Σq·u [31:0]   -> P = Σq·u / T
 //   0x3C SUM_QU_HI  RO  Σq·u [63:32]
 //   0x40 LIVE_CYC   RO  自上次清零以来累积的周期数
-//   0x44 IRQ_STAT   W1C [0]meas_done [1]overflow
-//   0x48 IRQ_EN     RW  [0]meas_done_en [1]overflow_en
+//   0x44 IRQ_STAT   W1C [0]meas_done [1]overflow [2]sync_lost [3]OTR
+//   0x48 IRQ_EN     RW  [0]meas_done_en [1]overflow_en [2]sync_lost_en [3]OTR_en
 //   ---- v2: PRPD 框选剔除区域 (REG0 / REG1, 各含相位与电荷量矩形) ----
 //   0x4C REG0_CFG   RW  [0]en0 [1]sem0(0=不统计不显示 1=仅剔除PRPD显示, 预留)
 //   0x50 REG0_PHASE RW  [23:12]phi1 [11:0]phi2 —— 相位窗号, phi1<=phi2
@@ -39,6 +40,12 @@
 //   0x58 REG1_PHASE RW  同上
 //   0x5C REG1_Q     RW  同上
 //   0x60 REG1_CFG   RW  [0]en1 [1]sem1  (更新清单补充: 原清单遗漏 REG1 使能寄存器)
+//   0x64 AD_MAX     RO  当前测量窗口内有符号 ADC 最大值(符号扩展)
+//   0x68 AD_MIN     RO  当前测量窗口内有符号 ADC 最小值(符号扩展)
+//   0x6C QUALITY    RO  [0]FIFO overflow [1]sync lost [2]OTR
+//   0x70 CYCLE_IDX  RO  周期统计包序号
+//   0x74 SYNC_MEAS_CNT RO 合法同步周期测量累计数
+//   0x78 CDC_DBG    RO  [0]packed FIFO overflow [1]四通道 DV skew
 //
 // 全局寄存器 (偏移, 基址 0x1000):
 //   0x1000 GCTRL     RW  [0]全局使能 [1]全局软复位
@@ -71,7 +78,8 @@ module pd_axil_regs #(
     parameter integer C_S_AXI_ADDR_WIDTH = 16,
     parameter integer NUM_CH             = 4,
     parameter integer PH_W               = `PD_PH_W,
-    parameter integer VERSION            = 32'h0003_0000
+    parameter integer VERSION            = 32'h0003_0000,
+    parameter integer SAMPLE_HZ          = 26000000
 )(
     // ================= AXI4-Lite Slave =================
     input  wire                          S_AXI_ACLK,
@@ -96,6 +104,7 @@ module pd_axil_regs #(
 
     // ================= 配置输出 (每通道) =================
     output wire [NUM_CH-1:0]             o_enable,
+    output wire [NUM_CH-1:0]             o_dc_mode,
     output wire [NUM_CH-1:0]             o_sw_rst,          // 单拍脉冲
     output wire [NUM_CH-1:0]             o_prpd_clear,      // 单拍脉冲
     output wire [2*NUM_CH-1:0]           o_mode,
@@ -132,6 +141,13 @@ module pd_axil_regs #(
     input  wire [192*NUM_CH-1:0]           i_neg_cnt,
     input  wire [32*NUM_CH-1:0]          i_frame_n_pos, i_frame_n_neg,
     input  wire [16*NUM_CH-1:0]          i_frame_ad_max, i_frame_ad_min,
+    input  wire [32*NUM_CH-1:0]          i_cycle_idx,
+    input  wire [16*NUM_CH-1:0]          i_ad_max, i_ad_min,
+    input  wire [32*NUM_CH-1:0]          i_sync_meas_cnt,
+    input  wire [NUM_CH-1:0]             i_sync_lost,
+    input  wire [NUM_CH-1:0]             i_otr,
+    input  wire                          i_fifo_ovf,
+    input  wire                          i_fifo_skew,
     input  wire [32*NUM_CH-1:0]          i_frame_id,
     input  wire [2*NUM_CH-1:0]           i_frame_stat,
     // 契约 v3.0 §5.3 APPLY_STATUS 数据源（来自各通道 core）
@@ -189,7 +205,7 @@ module pd_axil_regs #(
     // 消除 LUT1 驱动的可控硅式(net fanout)延迟, 同时打散 control set 拥塞。
     (* max_fanout = 64 *) reg [31:0] r_gctrl, r_girq_en;
 
-    reg [NUM_CH-1:0] irq_done, irq_ovf;
+    reg [NUM_CH-1:0] irq_done, irq_ovf, irq_sync_lost, irq_otr;
     reg [NUM_CH-1:0] meas_done_d;
 
     integer c;
@@ -203,6 +219,7 @@ module pd_axil_regs #(
     generate
         for (gi = 0; gi < NUM_CH; gi = gi + 1) begin : GEN_CFG_OUT
             assign o_enable[gi]              = r_ctrl[gi][0] & r_gctrl[0];
+            assign o_dc_mode[gi]             = r_ctrl[gi][6];
             assign o_mode[2*gi +: 2]         = r_cfg0[gi][1:0];
             assign o_phase_win[32*gi +: 32]  = {16'd0, r_cfg0[gi][31:16]};
             assign o_phase_inc[32*gi +: 32]  = r_phase_inc[gi];
@@ -346,6 +363,8 @@ module pd_axil_regs #(
             r_girq_en  <= 32'd0;
             irq_done    <= {NUM_CH{1'b0}};
             irq_ovf     <= {NUM_CH{1'b0}};
+            irq_sync_lost <= {NUM_CH{1'b0}};
+            irq_otr       <= {NUM_CH{1'b0}};
             meas_done_d <= {NUM_CH{1'b0}};
             apply_p <= 1'b0;
             applied_ch      <= {NUM_CH{1'b0}};
@@ -403,6 +422,8 @@ module pd_axil_regs #(
             for (c = 0; c < NUM_CH; c = c + 1) begin
                 if (i_meas_done[c] && !meas_done_d[c]) irq_done[c] <= 1'b1;
                 if (i_overflow[c])                     irq_ovf[c]  <= 1'b1;
+                if (i_sync_lost[c])                    irq_sync_lost[c] <= 1'b1;
+                if (i_otr[c])                          irq_otr[c] <= 1'b1;
             end
 
             if (slv_wren) begin
@@ -432,6 +453,8 @@ module pd_axil_regs #(
                                 5'd17: begin                       // 0x44 IRQ_STAT W1C
                                     if (wdata[0]) irq_done[wch] <= 1'b0;
                                     if (wdata[1]) irq_ovf[wch]  <= 1'b0;
+                                    if (wdata[2]) irq_sync_lost[wch] <= 1'b0;
+                                    if (wdata[3]) irq_otr[wch] <= 1'b0;
                                 end
                                 5'd18: r_irq_en[wch] <= wdata;     // 0x48 IRQ_EN
                                 5'd19: r_reg0_cfg[   wch] <= wdata; // 0x4C
@@ -451,6 +474,8 @@ module pd_axil_regs #(
                             8'd2: begin
                                       if (wdata[0]) irq_done <= {NUM_CH{1'b0}};
                                       if (wdata[1]) irq_ovf  <= {NUM_CH{1'b0}};
+                                      if (wdata[2]) irq_sync_lost <= {NUM_CH{1'b0}};
+                                      if (wdata[3]) irq_otr <= {NUM_CH{1'b0}};
                                   end
                             8'd3: r_girq_en <= wdata;
                             8'd9:  r_pos_thr[0] <= wdata[15:0];
@@ -520,7 +545,9 @@ module pd_axil_regs #(
                         5'd5:  rdata_r = r_upeak[rch];
                         5'd6:  rdata_r = r_deadtime[rch];
                         5'd7:  rdata_r = r_meas_cyc[rch];
-                        5'd8:  rdata_r = {29'd0, i_overflow[rch], irq_done[rch],
+                        // STATUS[3] is sticky history; sync_locked remains live current state.
+                        5'd8:  rdata_r = {27'd0, i_otr[rch], irq_sync_lost[rch],
+                                          i_overflow[rch], irq_done[rch],
                                           i_sync_locked[rch]};
                         5'd9:  rdata_r = i_sync_period[32*rch +: 32];
                         5'd10: rdata_r = i_n[32*rch +: 32];
@@ -530,7 +557,8 @@ module pd_axil_regs #(
                         5'd14: rdata_r = i_sum_qu[64*rch +: 32];
                         5'd15: rdata_r = i_sum_qu[64*rch+32 +: 32];
                         5'd16: rdata_r = i_live_cycles[32*rch +: 32];
-                        5'd17: rdata_r = {30'd0, irq_ovf[rch], irq_done[rch]};
+                        5'd17: rdata_r = {28'd0, irq_otr[rch], irq_sync_lost[rch],
+                                          irq_ovf[rch], irq_done[rch]};
                         5'd18: rdata_r = r_irq_en[rch];
                         5'd19: rdata_r = r_reg0_cfg[   rch];
                         5'd20: rdata_r = r_reg0_phase[rch];
@@ -538,6 +566,12 @@ module pd_axil_regs #(
                         5'd22: rdata_r = r_reg1_phase[rch];
                         5'd23: rdata_r = r_reg1_q[     rch];
                         5'd24: rdata_r = r_reg1_cfg[   rch];
+                        5'd25: rdata_r = {{16{i_ad_max[16*rch+15]}}, i_ad_max[16*rch +: 16]};
+                        5'd26: rdata_r = {{16{i_ad_min[16*rch+15]}}, i_ad_min[16*rch +: 16]};
+                        5'd27: rdata_r = {29'd0, i_otr[rch], i_sync_lost[rch], i_overflow[rch]};
+                        5'd28: rdata_r = i_cycle_idx[32*rch +: 32];
+                        5'd29: rdata_r = i_sync_meas_cnt[32*rch +: 32];
+                        5'd30: rdata_r = {30'd0, i_fifo_skew, i_fifo_ovf};
                         default: rdata_r = 32'd0;
                     endcase
                 end
@@ -548,7 +582,8 @@ module pd_axil_regs #(
                 case (ar_now[9:2])
                     8'd0: rdata_r = r_gctrl;
                     8'd1: rdata_r = {{(32-NUM_CH){1'b0}}, i_sync_locked};
-                    8'd2: rdata_r = {{(32-NUM_CH){1'b0}}, irq_done | irq_ovf};
+                    8'd2: rdata_r = {{(32-NUM_CH){1'b0}},
+                                     irq_done | irq_ovf | irq_sync_lost | irq_otr};
                     8'd3: rdata_r = r_girq_en;
                     8'd4: rdata_r = VERSION;
                     8'd5: rdata_r = NUM_CH[31:0];
@@ -560,7 +595,7 @@ module pd_axil_regs #(
                     8'd16,8'd17,8'd18,8'd19,8'd20,8'd21:
                         rdata_r = {16'd0, r_neg_thr[ar_now[9:2] - 8'd16]};
                     // ---- 契约 v3.0 §5.3 新增两个只读寄存器 ----
-                    8'd22: rdata_r = 32'd26000000;      // 0x1058 SAMPLE_RATE_HZ
+                    8'd22: rdata_r = SAMPLE_HZ;         // 0x1058 SAMPLE_RATE_HZ
                     // 0x105C APPLY_STATUS (契约 v3.0 §5.3 / §11.5, 字段已冻结):
                     //   bits3:0   pending_ch  每通道待应用标志
                     //   bits7:4   applied_ch  每通道已应用标志
@@ -612,7 +647,9 @@ module pd_axil_regs #(
     generate
         for (gi = 0; gi < NUM_CH; gi = gi + 1) begin : GEN_IRQ
             assign ch_irq[gi] = (irq_done[gi] & r_irq_en[gi][0]) |
-                                (irq_ovf[gi]  & r_irq_en[gi][1]);
+                                (irq_ovf[gi]  & r_irq_en[gi][1]) |
+                                (irq_sync_lost[gi] & r_irq_en[gi][2]) |
+                                (irq_otr[gi] & r_irq_en[gi][3]);
         end
     endgenerate
     assign irq = |ch_irq;

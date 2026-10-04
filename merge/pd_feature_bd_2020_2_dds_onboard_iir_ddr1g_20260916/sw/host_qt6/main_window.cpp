@@ -41,6 +41,7 @@
 #include <QWidget>
 
 #include <algorithm>
+#include <cmath>
 
 namespace {
 
@@ -374,7 +375,9 @@ MainWindow::MainWindow()
     m_pulseThreshold->setValue(kDefaultPulseThresholdCodes);
     m_pulseThreshold->setSuffix(QStringLiteral(" 码"));
     m_pulseThreshold->setToolTip(QStringLiteral(
-        "绝对阈值（ADC 码，相对基线）。与自适应阈值 6×sigma 取较大者生效。\n"
+        "上位机最终检测阈值（ADC 码，相对基线）。PL 只产生候选事件，\n"
+        "该值不会写入 PL；Qt 会用它同时筛选实时波形、事件椭圆和 PRPD 点。\n"
+        "与自适应阈值 6×sigma 取较大者生效。\n"
         "背景在这里是 42 码量级，PD 脉冲是 300~720 码，120 足够分开。\n"
         "设为 0 表示只用自适应阈值。"));
     pulseGrid->addWidget(m_pulseThreshold, 0, column++);
@@ -796,11 +799,12 @@ MainWindow::MainWindow()
     connect(m_pulseMaxDrawn, qOverload<int>(&QSpinBox::valueChanged),
             this, &MainWindow::applyPulseSettings);
     connect(m_bandEdit, &QLineEdit::textChanged, this, &MainWindow::applyPulseSettings);
-    /* 检测阈值会改变判据，需要让工作线程重算静态数据的脉冲。 */
+    /* 检测阈值只在上位机生效：让工作线程重算波形，同时改变新到事件的显示筛选；不写 PL。 */
     connect(m_pulseThreshold, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this] {
         applyPulseSettings();
-        m_pulseStats->setText(QStringLiteral(
-            "脉冲：判据已改；对实时帧立即生效，静态记录需重新抓取快照或重新导出。"));
+        appendLog(QStringLiteral("CFG"),
+                  QStringLiteral("上位机检测阈值=%1 码；PL 候选事件门限未修改，后续事件按此值筛选。")
+                      .arg(m_pulseThreshold->value(), 0, 'f', 0));
     });
     connect(m_scope, &ScopeWidget::pulsePicked, this, &MainWindow::onPulsePicked);
     connect(m_staticScope, &ScopeWidget::pulsePicked, this, &MainWindow::onPulsePicked);
@@ -822,7 +826,7 @@ MainWindow::MainWindow()
          * 留在 GUI 线程比每帧跨线程往返更划算；只有 520,000 点的静态记录
          * 才交给工作线程。
          */
-        if (m_pulseOverlay->isChecked()) {
+        if (m_pulseOverlay->isChecked() && !m_scope->eventHoldActive()) {
             const pddetect::Result pulses = pddetect::detect(frame, m_pulseSettings);
             m_livePulses = pddetect::flatten(pulses);
             m_scope->setPulses(m_livePulses);
@@ -832,6 +836,31 @@ MainWindow::MainWindow()
         ++m_liveFftCounter;
         if ((m_liveFftCounter % 4U) == 1U && frame.sampleCount >= 1024)
             refreshSpectrumFor(frame);
+    });
+    connect(m_stream, &ScopeStream::eventFrame, this,
+            [this](const pdsample::WaveformFrame &frame, quint32 eventSequence) {
+        if (m_pulseOverlay->isChecked()) {
+            const pddetect::Result pulses = pddetect::detect(frame, m_pulseSettings);
+            m_livePulses = pddetect::flatten(pulses);
+            m_scope->setPulses(m_livePulses);
+            updatePulseStatistics();
+        }
+        m_scope->setEventFrame(frame,
+                               QStringLiteral("PL 局放事件 seq=%1（事件中心波形）")
+                                   .arg(eventSequence),
+                               500);
+        appendLog(QStringLiteral("EVENT-WAVE"),
+                  QStringLiteral("已显示 PL 事件 %1 的中心波形（保持 500 ms）。")
+                      .arg(eventSequence));
+        /* PRPD 归档回合在等待这一个二进制帧；现在安全地取下一条。 */
+        if (m_eventDownloadInFlight) nextPrpdCandidate();
+    });
+    connect(m_stream, &ScopeStream::eventFrameFailed, this,
+            [this](quint32 eventSequence, const QString &reason) {
+        appendLog(QStringLiteral("ERR"),
+                  QStringLiteral("事件 %1 中心波形获取失败：%2")
+                      .arg(eventSequence).arg(reason));
+        if (m_eventDownloadInFlight) nextPrpdCandidate();
     });
     connect(m_stream, &ScopeStream::rollFrame, this,
             [this](const pdsample::WaveformFrame &frame) { m_scope->appendRollFrame(frame); });
@@ -1661,8 +1690,24 @@ void MainWindow::onEventBatchDecoded(QVector<pdsample::PeakEvent> events, quint3
 
     accountEventSequences(events);
 
-    QVector<QVector<pdsample::PeakEvent>> perChannel(pdsample::kChannelCount);
+    /*
+     * PL 事件归档是候选事件源，不能把 PL 的固定 cfg_thresh 当作用户阈值。
+     * 最终的动态阈值在 Qt 端按事件字段的 ADC 码绝对幅值执行；
+     * accountEventSequences() 仍对全部原始事件统计，避免把被筛掉的候选误报成丢帧。
+     */
+    m_hostEventSeen += static_cast<quint64>(events.size());
+    QVector<pdsample::PeakEvent> qualifiedEvents;
+    qualifiedEvents.reserve(events.size());
     for (const pdsample::PeakEvent &event : events) {
+        if (passesHostEventThreshold(event))
+            qualifiedEvents.append(event);
+        else
+            ++m_hostEventRejected;
+    }
+    m_hostEventAccepted += static_cast<quint64>(qualifiedEvents.size());
+
+    QVector<QVector<pdsample::PeakEvent>> perChannel(pdsample::kChannelCount);
+    for (const pdsample::PeakEvent &event : qualifiedEvents) {
         if (event.channel < 0 || event.channel >= pdsample::kChannelCount) continue;
         perChannel[event.channel].append(event);
     }
@@ -1716,10 +1761,16 @@ void MainWindow::onEventBatchDecoded(QVector<pdsample::PeakEvent> events, quint3
     }
     updatePulseStatistics();
 
-    /* 解码完成，回合在这里才推进（下载完成时只提交解码）。 */
+    /* 解码完成。先请求同一 PL 事件对应的中心波形；二进制帧结束后，
+       eventFrame 信号会再推进回合，避免与 EVENT 下载抢同一条 TCP 链路。 */
     if (m_eventDownloadInFlight) {
         ++m_prpdRoundFetched;
-        nextPrpdCandidate();
+        const bool requestEventWave = !qualifiedEvents.isEmpty() &&
+                                      m_stream->state() == ScopeStream::State::Streaming;
+        if (requestEventWave)
+            m_stream->requestEventFrame(sequence);
+        else
+            nextPrpdCandidate();
     }
 }
 
@@ -1814,6 +1865,7 @@ void MainWindow::applyPulseSettings()
     if (m_worker == nullptr || m_pulseThreshold == nullptr) return;
 
     pddetect::Settings settings;
+    /* 该设置只传给 Qt 分析线程；没有任何 AXI/TCP 写寄存器动作。 */
     settings.absoluteThresholdCodes = m_pulseThreshold->value();
     settings.adaptiveMultiplier = 6.0;
     settings.mergeGapSamples = 16;
@@ -1860,6 +1912,15 @@ void MainWindow::applyPulseSettings()
         m_staticScope->setPulses(m_staticPulses);
     }
     updatePulseStatistics();
+}
+
+bool MainWindow::passesHostEventThreshold(const pdsample::PeakEvent &event) const
+{
+    if (m_pulseThreshold == nullptr || m_pulseThreshold->value() <= 0.0)
+        return true;
+
+    /* PeakEvent::adcCodes 是事件字段按默认 Q8.8=256 换算后的 ADC 码域值。 */
+    return std::fabs(event.adcCodes) >= m_pulseThreshold->value();
 }
 
 void MainWindow::accountEventSequences(const QVector<pdsample::PeakEvent> &events)
@@ -1919,7 +1980,7 @@ void MainWindow::updatePulseStatistics()
     m_pulseStats->setText(
         QStringLiteral("脉冲：实时 %1 个（确认 %2，各通道 %3，峰 %4 码）｜"
                        "归档 %5 个（确认 %6，峰 %7 码）｜判据 max(%8 码, 6×sigma)｜"
-                       "事件字 %9，记录内跳号 %10，不识别 %11")
+                       "PL候选 %9，主机通过 %10，筛掉 %11｜记录内跳号 %12，不识别 %13")
             .arg(m_livePulses.size())
             .arg(liveConfirmed)
             .arg(channelDetail)
@@ -1928,6 +1989,9 @@ void MainWindow::updatePulseStatistics()
             .arg(staticConfirmed)
             .arg(staticPeak, 0, 'f', 0)
             .arg(m_pulseThreshold->value(), 0, 'f', 0)
+            .arg(m_hostEventSeen)
+            .arg(m_hostEventAccepted)
+            .arg(m_hostEventRejected)
             .arg(m_evtSeqTotal)
             .arg(m_evtSeqGaps)
             .arg(m_unrecognisedEvents));

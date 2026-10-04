@@ -12,7 +12,7 @@ namespace {
 const QRegularExpression &scopeHeader()
 {
     static const QRegularExpression expression(
-        QStringLiteral("^SCOPE V1 seq=(\\d+) samples=(\\d+) bytes=(\\d+) fs=(\\d+) crc32=([0-9a-fA-F]{8})"));
+        QStringLiteral("^SCOPE V[12] seq=(\\d+) samples=(\\d+) bytes=(\\d+) fs=(\\d+) crc32=([0-9a-fA-F]{8})"));
     return expression;
 }
 
@@ -132,6 +132,8 @@ void ScopeStream::start()
     }
     m_stopRequested = false;
     m_singleShotPending = false;
+    m_eventRequestPending = false;
+    m_eventFrameInFlight = false;
     m_consecutiveTimeouts = 0;
     m_statistics.triggerMisses = 0;
     /* 重启后本机不知道板端 seq 的起点，重置基线，避免把重启当成跳号。 */
@@ -181,6 +183,8 @@ void ScopeStream::stop()
 {
     m_stopRequested = true;
     m_singleShotPending = false;
+    m_eventRequestPending = false;
+    m_eventFrameInFlight = false;
     m_paceTimer->stop();
     m_watchdog->stop();
     m_orchestrationTimer->stop();
@@ -221,6 +225,35 @@ void ScopeStream::setSuspendRequests(bool suspended)
         emit logLine(QStringLiteral("[scope] 恢复取帧。"));
         if (m_state == State::Streaming) scheduleFrameRequest();
     }
+}
+
+void ScopeStream::requestEventFrame(quint32 eventSequence)
+{
+    if (m_client == nullptr || !m_client->isConnected() ||
+        m_state == State::Idle || m_state == State::Fault) {
+        emit eventFrameFailed(eventSequence, QStringLiteral("实时取帧尚未开启或 TCP 未连接。"));
+        return;
+    }
+    /* Keep only the newest event: while a PRPD archive record is being decoded,
+       a burst of events should not build an unbounded binary-transfer queue. */
+    m_pendingEventSequence = eventSequence;
+    m_eventRequestPending = true;
+    requestPendingEventFrame();
+}
+
+void ScopeStream::requestPendingEventFrame()
+{
+    if (!m_eventRequestPending || m_eventFrameInFlight || m_frameInFlight ||
+        m_client == nullptr || !m_client->isConnected() ||
+        m_state == State::Idle || m_state == State::Fault)
+        return;
+    m_eventFrameInFlight = true;
+    m_eventSequenceInFlight = m_pendingEventSequence;
+    m_eventRequestPending = false;
+    m_paceTimer->stop();
+    setFrameInFlight(true);
+    send(QStringLiteral("SCOPE EVENT SEQ %1 %2").arg(m_eventSequenceInFlight).arg(m_samples));
+    m_watchdog->start(m_watchdogMs);
 }
 
 void ScopeStream::flushPendingScopeOff()
@@ -339,6 +372,11 @@ void ScopeStream::handleBoardError(const QString &line)
     if (line.contains(QStringLiteral("still active"))) {
         /* 上一次传输尚未收尾；等在途状态自然结束，稍后重试。 */
         setFrameInFlight(false);
+        if (m_eventFrameInFlight) {
+            const quint32 sequence = m_eventSequenceInFlight;
+            m_eventFrameInFlight = false;
+            emit eventFrameFailed(sequence, line);
+        }
         m_watchdog->stop();
         if (m_state == State::Streaming) m_paceTimer->start(50);
         return;
@@ -352,6 +390,11 @@ void ScopeStream::handleBoardError(const QString &line)
     if (line.contains(QStringLiteral("requires a running acquisition"))) {
         /* 采集停了（可能是用户按了 STOP，或有界采集跑完）。按配置决定是否自动重启。 */
         setFrameInFlight(false);
+        if (m_eventFrameInFlight) {
+            const quint32 sequence = m_eventSequenceInFlight;
+            m_eventFrameInFlight = false;
+            emit eventFrameFailed(sequence, line);
+        }
         m_watchdog->stop();
         if (m_autoStart && !m_stopRequested) {
             setState(State::WaitingAcquisition, QStringLiteral("采集已停止，自动重启连续采集…"));
@@ -364,9 +407,23 @@ void ScopeStream::handleBoardError(const QString &line)
     }
     if (line.contains(QStringLiteral("raw DDR ring is not ready"))) {
         setFrameInFlight(false);
+        if (m_eventFrameInFlight) {
+            const quint32 sequence = m_eventSequenceInFlight;
+            m_eventFrameInFlight = false;
+            emit eventFrameFailed(sequence, line);
+        }
         m_watchdog->stop();
         /* 环尚未就绪通常出现在采集刚开始时，稍后重试。 */
         m_paceTimer->start(200);
+        return;
+    }
+    if (m_eventFrameInFlight) {
+        const quint32 sequence = m_eventSequenceInFlight;
+        m_eventFrameInFlight = false;
+        setFrameInFlight(false);
+        m_watchdog->stop();
+        emit eventFrameFailed(sequence, line);
+        if (m_state == State::Streaming && !m_suspendRequests) scheduleFrameRequest();
         return;
     }
     /* 其它与 SCOPE 相关的错误：停在故障态，把处置权交回用户，不静默续跑。 */
@@ -377,8 +434,11 @@ void ScopeStream::handleBoardError(const QString &line)
 
 void ScopeStream::onScopeFrame(const QByteArray &raw, quint32 samples, quint32 sampleRateHz)
 {
+    const bool isEventFrame = m_eventFrameInFlight;
+    const quint32 eventSequence = m_eventSequenceInFlight;
     m_watchdog->stop();
     setFrameInFlight(false);
+    m_eventFrameInFlight = false;
     m_consecutiveTimeouts = 0;
 
     pdsample::WaveformFrame frame;
@@ -389,6 +449,8 @@ void ScopeStream::onScopeFrame(const QByteArray &raw, quint32 samples, quint32 s
         emit statisticsChanged();
         emit logLine(QStringLiteral("[scope] 帧长度不符合 24 字节块契约：收到 %1 字节，期望 %2。")
                          .arg(raw.size()).arg(samples * pdsample::kBytesPerSample));
+        if (isEventFrame) emit eventFrameFailed(eventSequence, QStringLiteral("事件波形帧长度无效。"));
+        requestPendingEventFrame();
         if (m_state == State::Streaming) scheduleFrameRequest();
         flushPendingScopeOff();
         return;
@@ -397,6 +459,21 @@ void ScopeStream::onScopeFrame(const QByteArray &raw, quint32 samples, quint32 s
     if (m_statistics.lastSequence >= 0 && frame.sequence != m_statistics.lastSequence + 1)
         ++m_statistics.sequenceGaps;
     m_statistics.lastSequence = frame.sequence;
+
+    if (isEventFrame) {
+        /* An event-centred frame is a short inspection hold, not a replacement
+           for the continuous live stream.  The widget decides how long it is
+           visible; the stream can remain suspended while PRPD consumes the
+           event archive. */
+        emit eventFrame(frame, eventSequence);
+        if (!m_suspendRequests && m_state == State::Streaming)
+            scheduleFrameRequest();
+        else
+            requestPendingEventFrame();
+        emit statisticsChanged();
+        flushPendingScopeOff();
+        return;
+    }
 
     int triggerIndex = -1;
     bool triggerValid = false;
@@ -428,6 +505,7 @@ void ScopeStream::onScopeFrame(const QByteArray &raw, quint32 samples, quint32 s
         return;
     }
     scheduleFrameRequest();
+    requestPendingEventFrame();
     flushPendingScopeOff();
 }
 
@@ -454,6 +532,11 @@ void ScopeStream::onWatchdog()
     ++m_statistics.timeouts;
     ++m_consecutiveTimeouts;
     setFrameInFlight(false);
+    if (m_eventFrameInFlight) {
+        const quint32 sequence = m_eventSequenceInFlight;
+        m_eventFrameInFlight = false;
+        emit eventFrameFailed(sequence, QStringLiteral("事件波形帧超时。"));
+    }
     emit statisticsChanged();
     emit logLine(QStringLiteral("[scope] 帧超时（第 %1 次，累计 %2 次）。")
                      .arg(m_consecutiveTimeouts).arg(m_statistics.timeouts));
@@ -477,10 +560,16 @@ void ScopeStream::onDownloadFailed(const QString &reason)
     if (!m_frameInFlight) return;
     setFrameInFlight(false);
     m_watchdog->stop();
+    if (m_eventFrameInFlight) {
+        const quint32 sequence = m_eventSequenceInFlight;
+        m_eventFrameInFlight = false;
+        emit eventFrameFailed(sequence, reason);
+    }
     ++m_statistics.crcErrors;
     emit statisticsChanged();
     emit logLine(QStringLiteral("[scope] 帧校验失败：%1").arg(reason));
     if (m_state == State::Streaming) scheduleFrameRequest();
+    requestPendingEventFrame();
 }
 
 void ScopeStream::onTransportError(const QString &message)

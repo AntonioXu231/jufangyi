@@ -17,6 +17,7 @@
 #include "lwip/pbuf.h"
 #include "lwip/tcp.h"
 #include <ctype.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,7 +29,11 @@
 #define PD_SCOPE_SAMPLE_BYTES    6U
 #define PD_SCOPE_DEFAULT_SAMPLES 1024U
 #define PD_SCOPE_MAX_SAMPLES     2048U
-#define PD_SCOPE_MAX_PEAKS       256U
+#define PD_SCOPE_ENV_BINS        1024U
+#define PD_SCOPE_ENV_CHANNELS    4U
+#define PD_SCOPE_ENV_BYTES       (PD_SCOPE_ENV_BINS * PD_SCOPE_ENV_CHANNELS * 4U)
+#define PD_SCOPE_CYCLE_SAMPLES   520000U
+#define PD_SCOPE_ENV_STEP_SAMPLES 32768U
 /* 24 KiB is 1024 complete four-sample (24-byte) PL write blocks. */
 #define PD_SCOPE_SAFETY_BYTES    24576U
 
@@ -59,11 +64,35 @@ typedef struct {
     u32 samples;
     u32 sequence;
     u32 peak_cursor;
+    u32 last_frame_sequence;
+    u32 last_frame_valid;
 } pd_scope_state_t;
 
-static pd_scope_state_t s_scope = {0U, PD_SCOPE_DEFAULT_SAMPLES, 0U, 0U};
+static pd_scope_state_t s_scope = {0U, PD_SCOPE_DEFAULT_SAMPLES, 0U, 0U, 0U, 0U};
 static u8 s_scope_buffer[PD_SCOPE_MAX_SAMPLES * PD_SCOPE_SAMPLE_BYTES];
-static u64 s_scope_peak_buffer[PD_SCOPE_MAX_PEAKS];
+static u16 s_scope_fft_bins[PD_FFT_POINTS / 2U + 1U];
+static u8 s_scope_fft_buffer[(PD_FFT_POINTS / 2U + 1U) * 2U];
+typedef struct {
+    u32 active;
+    u32 ready;
+    u32 snapshot_sequence;
+    u32 snapshot_bytes;
+    u32 snapshot_addr;
+    u32 sample_count;
+    u32 sample_cursor;
+    u32 bin_cursor;
+    u32 lock_mask;
+    u32 checksum;
+    s16 minimum[PD_SCOPE_ENV_BINS][PD_SCOPE_ENV_CHANNELS];
+    s16 maximum[PD_SCOPE_ENV_BINS][PD_SCOPE_ENV_CHANNELS];
+    u8 payload[PD_SCOPE_ENV_BYTES];
+    char header[192];
+} pd_scope_envelope_job_t;
+static pd_scope_envelope_job_t s_scope_envelope;
+/* Stage one complete event packet before TCP transfer, so the archive ring can
+ * continue receiving packets while this connection drains its own copy. */
+static u64 s_scope_peak_buffer[PD_EVENT_ARCHIVE_STRIDE / sizeof(u64)];
+static u32 s_scope_peak_skipped;
 
 static u32 ddr_read(u32 off) { return Xil_In32(PD_DDR_BASE + off); }
 static u32 dma_read(u32 off) { return Xil_In32(PD_DMA_BASE + off); }
@@ -176,9 +205,9 @@ static void reply_status(void)
 
 static void reply_config(void)
 {
-    char out[320];
+    char out[384];
     (void)snprintf(out, sizeof(out),
-        "CONFIG api=13 default_limit=%lu event_slots=%u event_stride=%lu snap_slots=%u snap_stride=%lu analysis_slots=%u sweep_slots=%u sweep_windows=%u prpd_bins=%u scope=%lu/%lu alert_mask=%lx alert_delta=%ld get_max=%u state=%lu\r\n",
+        "CONFIG api=16 default_limit=%lu event_slots=%u event_stride=%lu snap_slots=%u snap_stride=%lu analysis_slots=%u sweep_slots=%u sweep_windows=%u prpd_bins=%u scope=%lu/%lu scope_fft=ps_q15_1024x1_bins513 scope_env=cycle520000_bins1024_ch4_minmax16 alert_mask=%lx alert_delta=%ld get_max=%u state=%lu\r\n",
         (unsigned long)pd_acq_default_packet_limit(), PD_EVENT_ARCHIVE_COUNT,
         (unsigned long)PD_EVENT_ARCHIVE_STRIDE, PD_SNAP_ARCHIVE_COUNT,
         (unsigned long)PD_SNAP_ARCHIVE_STRIDE, PD_ANALYSIS_ARCHIVE_COUNT,
@@ -207,7 +236,7 @@ static void reply_report(void)
     char out[320];
 
     (void)snprintf(out, sizeof(out),
-        "REPORT api=13 state=%lu event_seq=[%lu,%lu) snap_seq=[%lu,%lu) analysis_seq=[%lu,%lu) sweep_seq=[%lu,%lu) alert_mask=0x%lx alert_delta=%ld ddr=%08lx slot=%08lx dma=%08lx drops=%lu err=%s\r\n",
+        "REPORT api=16 state=%lu event_seq=[%lu,%lu) snap_seq=[%lu,%lu) analysis_seq=[%lu,%lu) sweep_seq=[%lu,%lu) alert_mask=0x%lx alert_delta=%ld ddr=%08lx slot=%08lx dma=%08lx drops=%lu err=%s\r\n",
         (unsigned long)pd_acq_state(), (unsigned long)event_first,
         (unsigned long)event_next, (unsigned long)snapshot_first,
         (unsigned long)snapshot_next, (unsigned long)analysis_first,
@@ -1029,7 +1058,7 @@ static void start_sweep(char *line)
  */
 static void start_scope_frame(void)
 {
-    u32 ring_base, ring_size, wr_off, bytes, start, first, sum;
+    u32 ring_base, ring_size, wr_off, bytes, start, first, sum, sequence;
     char out[160];
 
     if (!s_scope.enabled) {
@@ -1067,11 +1096,14 @@ static void start_scope_frame(void)
     }
 
     sum = crc32(s_scope_buffer, bytes);
+    sequence = s_scope.sequence++;
     (void)snprintf(out, sizeof(out),
         "SCOPE V1 seq=%lu samples=%lu bytes=%lu fs=26000000 crc32=%08lx\r\n",
-        (unsigned long)s_scope.sequence++, (unsigned long)s_scope.samples,
+        (unsigned long)sequence, (unsigned long)s_scope.samples,
         (unsigned long)bytes, (unsigned long)sum);
     if (reply(out) != 0) return;
+    s_scope.last_frame_sequence = sequence;
+    s_scope.last_frame_valid = 1U;
     s_transfer.addr = (UINTPTR)s_scope_buffer;
     s_transfer.offset = 0U;
     s_transfer.remaining = bytes;
@@ -1081,18 +1113,189 @@ static void start_scope_frame(void)
     s_transfer.active = 1U;
 }
 
+/* Analyze the exact most recently transmitted live waveform frame on the PS.
+ * The returned little-endian u16 array is a single-sided 1024-point Hann FFT:
+ * bins 0..512, magnitude in approximate ADC peak-code units. */
+static void start_scope_fft(char *text)
+{
+    u32 channel, bin, bytes = sizeof(s_scope_fft_buffer), sum;
+    pd_spectrum_channel_t result;
+    char out[256];
+    char *cursor = text;
+
+    /* Accept the explicit CHANNEL keyword used by the Qt live-scope client,
+       while keeping the original compact `SCOPE FFT <channel>` form valid. */
+    if (strncmp(cursor, "CHANNEL ", 8U) == 0) cursor += 8;
+    if (parse_single_u32(cursor, &channel) != 0 || channel >= PD_SNAPSHOT_CHANNELS) {
+        (void)reply("ERR usage: SCOPE FFT CHANNEL channel(0..3)\r\n");
+        return;
+    }
+    if (!s_scope.enabled || !s_scope.last_frame_valid ||
+        s_scope.samples != PD_FFT_POINTS) {
+        (void)reply("ERR SCOPE FFT requires a completed live frame configured for exactly 1024 samples\r\n");
+        return;
+    }
+    if (s_transfer.active) {
+        (void)reply("ERR SCOPE transfer is still active\r\n");
+        return;
+    }
+    if (pd_spectrum_analyze_channel(s_scope_buffer,
+                                    s_scope.samples * PD_SCOPE_SAMPLE_BYTES,
+                                    0U, PD_SPECTRUM_DEFAULT_FS_HZ, channel,
+                                    s_scope_fft_bins, &result) != XST_SUCCESS) {
+        (void)reply("ERR SCOPE FFT analysis failed\r\n");
+        return;
+    }
+    /* The byte buffer is deliberately explicit little endian on the wire. */
+    for (bin = 0U; bin <= PD_FFT_POINTS / 2U; ++bin) {
+        const u16 magnitude = s_scope_fft_bins[bin];
+        s_scope_fft_buffer[bin * 2U] = (u8)(magnitude & 0xFFU);
+        s_scope_fft_buffer[bin * 2U + 1U] = (u8)(magnitude >> 8);
+    }
+    sum = crc32(s_scope_fft_buffer, bytes);
+    (void)snprintf(out, sizeof(out),
+        "SCOPE_FFT V1 seq=%lu channel=%lu samples=%u points=%u fs=%lu bin_hz=%lu peak_bin=%lu peak_hz=%lu amplitude=%lu dc=%lu bytes=%lu crc32=%08lx\r\n",
+        (unsigned long)s_scope.last_frame_sequence, (unsigned long)channel,
+        PD_FFT_POINTS, PD_FFT_POINTS,
+        (unsigned long)PD_SPECTRUM_DEFAULT_FS_HZ,
+        (unsigned long)(PD_SPECTRUM_DEFAULT_FS_HZ / PD_FFT_POINTS),
+        (unsigned long)result.peak_bin, (unsigned long)result.peak_hz,
+        (unsigned long)result.amplitude_code, (unsigned long)result.dc_code,
+        (unsigned long)bytes, (unsigned long)sum);
+    if (reply(out) != 0) return;
+    s_transfer.addr = (UINTPTR)s_scope_fft_buffer;
+    s_transfer.offset = 0U;
+    s_transfer.remaining = bytes;
+    s_transfer.invalidate_cache = 0U;
+    s_transfer.active = 1U;
+}
+
+/*
+ * Return a waveform window centred on a retained PL peak event.
+ *
+ * The PL event packet intentionally carries phase (not a DDR byte address),
+ * while the snapshot writer freezes a complete 50 Hz cycle on cycle_start.
+ * Therefore the event phase can be mapped into the newest archived cycle and
+ * a short, event-centred raw window can be streamed without changing the
+ * 64-bit PL event protocol.  The snapshot/event records are allowed to differ
+ * by a few cycles; the header exposes both sequence numbers so the host can
+ * show this correlation explicitly.
+ */
+static void start_scope_event(u32 event_sequence, u32 samples)
+{
+    pd_event_record_t event_record;
+    pd_snapshot_record_t snapshot_record;
+    const u64 *event_words;
+    u32 latest_snapshot;
+    u32 phase = 0U, channel = 0U, phase_win;
+    u32 i, total_samples, center, start, bytes, sum;
+    int have_peak = 0;
+    char out[256];
+
+    if (!s_scope.enabled) {
+        (void)reply("ERR SCOPE is off; send SCOPE ON [samples] first\r\n");
+        return;
+    }
+    if (pd_acq_state() == PD_ACQ_IDLE) {
+        (void)reply("ERR SCOPE requires a running acquisition\r\n");
+        return;
+    }
+    if (s_transfer.active) {
+        (void)reply("ERR SCOPE transfer is still active\r\n");
+        return;
+    }
+    if (pd_acq_get_event_by_sequence(event_sequence, &event_record) != XST_SUCCESS ||
+        event_record.bytes == 0U || event_record.bytes > PD_EVENT_ARCHIVE_STRIDE ||
+        (event_record.bytes & 7U) != 0U) {
+        (void)reply("ERR SCOPE event sequence is outside the retained archive window\r\n");
+        return;
+    }
+    if (g_pd_acq.snapshot_sequence == 0U ||
+        pd_acq_get_snapshot_by_sequence(g_pd_acq.snapshot_sequence - 1U,
+                                        &snapshot_record) != XST_SUCCESS ||
+        snapshot_record.archive_addr == 0U || snapshot_record.bytes < PD_SCOPE_SAMPLE_BYTES) {
+        (void)reply("ERR SCOPE no archived snapshot is ready\r\n");
+        return;
+    }
+
+    Xil_DCacheInvalidateRange((UINTPTR)event_record.ddr_addr, event_record.bytes);
+    event_words = (const u64 *)(UINTPTR)event_record.ddr_addr;
+    for (i = 0U; i < event_record.bytes / 8U; ++i) {
+        const u64 word = event_words[i];
+        /* Peak words have type 0x00; cycle summaries have type 0x01. */
+        if ((u32)(word >> 56) == 0U) {
+            phase = (u32)((word >> 28) & 0xFFFU);
+            channel = (u32)((word >> 25) & 0x3U);
+            have_peak = 1;
+            break;
+        }
+    }
+    if (!have_peak) {
+        (void)reply("ERR SCOPE event has no peak word\r\n");
+        return;
+    }
+
+    phase_win = Xil_In32(PD_FEATURE_BASE + PD_FEATURE_CFG0(channel)) >> 16;
+    if (phase_win == 0U) phase_win = 4096U;
+    total_samples = snapshot_record.bytes / PD_SCOPE_SAMPLE_BYTES;
+    if (total_samples < samples) {
+        (void)reply("ERR SCOPE snapshot is shorter than requested window\r\n");
+        return;
+    }
+    center = (phase * total_samples + (phase_win / 2U)) / phase_win;
+    if (center >= total_samples) center = total_samples - 1U;
+    start = center > samples / 2U ? center - samples / 2U : 0U;
+    if (start + samples > total_samples) start = total_samples - samples;
+    bytes = samples * PD_SCOPE_SAMPLE_BYTES;
+
+    /* Snapshot data is contiguous and sample-aligned; pack it in the same
+       little-endian 48-bit format used by SCOPE V1. */
+    s_scope.last_frame_valid = 0U;
+    Xil_DCacheInvalidateRange((UINTPTR)snapshot_record.archive_addr + start * PD_SCOPE_SAMPLE_BYTES,
+                              bytes);
+    for (i = 0U; i < samples; ++i) {
+        u16 sample[PD_SNAPSHOT_CHANNELS];
+        u8 *dst = &s_scope_buffer[i * PD_SCOPE_SAMPLE_BYTES];
+        if (pd_snapshot_read_sample((const void *)(UINTPTR)snapshot_record.archive_addr,
+                                    snapshot_record.bytes, start + i, sample) != XST_SUCCESS) {
+            (void)reply("ERR SCOPE snapshot sample decode failed\r\n");
+            return;
+        }
+        dst[0] = (u8)(sample[0] & 0xFFU);
+        dst[1] = (u8)(((sample[0] >> 8) & 0x0FU) | ((sample[1] & 0x0FU) << 4));
+        dst[2] = (u8)((sample[1] >> 4) & 0xFFU);
+        dst[3] = (u8)(sample[2] & 0xFFU);
+        dst[4] = (u8)(((sample[2] >> 8) & 0x0FU) | ((sample[3] & 0x0FU) << 4));
+        dst[5] = (u8)((sample[3] >> 4) & 0xFFU);
+    }
+    sum = crc32(s_scope_buffer, bytes);
+    latest_snapshot = snapshot_record.sequence;
+    (void)snprintf(out, sizeof(out),
+        "SCOPE V2 seq=%lu samples=%lu bytes=%lu fs=26000000 crc32=%08lx source=SNAP snap_seq=%lu event_seq=%lu start=%lu center=%lu phase=%lu channel=%lu\r\n",
+        (unsigned long)s_scope.sequence++, (unsigned long)samples,
+        (unsigned long)bytes, (unsigned long)sum,
+        (unsigned long)latest_snapshot, (unsigned long)event_sequence,
+        (unsigned long)start, (unsigned long)center, (unsigned long)phase,
+        (unsigned long)channel);
+    if (reply(out) != 0) return;
+    s_transfer.addr = (UINTPTR)s_scope_buffer;
+    s_transfer.offset = 0U;
+    s_transfer.remaining = bytes;
+    s_transfer.invalidate_cache = 0U;
+    s_transfer.active = 1U;
+}
+
 /* Copy one retained PL event packet into a PS-owned transfer buffer.  The
  * peak phase is measured against sync_in by pd_feature_core, not inferred
- * from the unrelated 1024-sample raw DDR oscilloscope window.  Sampling the
- * peaks evenly keeps the network/UI load bounded without distorting the
- * packet's phase coverage toward its beginning. */
+ * from the unrelated raw DDR oscilloscope window.  API 15 transfers every
+ * peak word and its cycle words without intentional thinning. */
 static void start_scope_peaks(void)
 {
-    u32 next, first, sequence, index, total, stride, selected, bytes;
+    u32 next, first, sequence, index, peaks, words_count, bytes, gap = 0U;
     u32 win[4], lock_mask = 0U, channel;
     pd_event_record_t record;
     const u64 *words;
-    char out[160];
+    char out[256];
 
     if (!s_scope.enabled) {
         (void)reply("ERR SCOPE is off; send SCOPE ON [samples] first\r\n");
@@ -1104,9 +1307,16 @@ static void start_scope_peaks(void)
     }
     next = g_pd_acq.event_sequence;
     first = next > PD_EVENT_ARCHIVE_COUNT ? next - PD_EVENT_ARCHIVE_COUNT : 0U;
-    if (s_scope.peak_cursor < first) s_scope.peak_cursor = first;
+    if (s_scope.peak_cursor < first) {
+        gap = first - s_scope.peak_cursor;
+        s_scope_peak_skipped += gap;
+        s_scope.peak_cursor = first;
+    }
     if (s_scope.peak_cursor >= next) {
-        (void)snprintf(out, sizeof(out), "PEAKS NONE next=%lu\r\n", (unsigned long)next);
+        (void)snprintf(out, sizeof(out),
+            "PEAKS NONE first=%lu next=%lu skipped=%lu\r\n",
+            (unsigned long)first, (unsigned long)next,
+            (unsigned long)s_scope_peak_skipped);
         (void)reply(out);
         return;
     }
@@ -1114,38 +1324,49 @@ static void start_scope_peaks(void)
     if (pd_acq_get_event_by_sequence(sequence, &record) != XST_SUCCESS ||
         record.bytes == 0U || record.bytes > PD_EVENT_ARCHIVE_STRIDE ||
         (record.bytes & 7U) != 0U) {
-        (void)snprintf(out, sizeof(out), "PEAKS SKIP seq=%lu\r\n", (unsigned long)sequence);
+        ++s_scope_peak_skipped;
+        (void)snprintf(out, sizeof(out), "PEAKS SKIP seq=%lu skipped=%lu\r\n",
+            (unsigned long)sequence, (unsigned long)s_scope_peak_skipped);
         (void)reply(out);
         return;
     }
     Xil_DCacheInvalidateRange((UINTPTR)record.ddr_addr, record.bytes);
     words = (const u64 *)(UINTPTR)record.ddr_addr;
-    total = record.peak_words;
-    stride = total > PD_SCOPE_MAX_PEAKS ?
-             (total + PD_SCOPE_MAX_PEAKS - 1U) / PD_SCOPE_MAX_PEAKS : 1U;
-    selected = 0U;
-    total = 0U;
-    for (index = 0U; index < record.bytes / 8U; ++index) {
-        u64 word = words[index];
-        if ((u32)(word >> 56) != 0U) continue;
-        if ((total % stride) == 0U && selected < PD_SCOPE_MAX_PEAKS)
-            s_scope_peak_buffer[selected++] = word;
-        ++total;
+    words_count = record.bytes / 8U;
+    if (words_count > (PD_EVENT_ARCHIVE_STRIDE / sizeof(u64))) {
+        (void)reply("ERR SCOPE event packet exceeds transfer buffer\r\n");
+        return;
     }
-    bytes = selected * 8U;
+    peaks = 0U;
+    for (index = 0U; index < words_count; ++index) {
+        const u64 word = words[index];
+        const u32 type = (u32)(word >> 56);
+        if (type == 0U) ++peaks;
+        else if (type != 1U) {
+            ++s_scope_peak_skipped;
+            (void)snprintf(out, sizeof(out), "PEAKS SKIP seq=%lu skipped=%lu\r\n",
+                (unsigned long)sequence, (unsigned long)s_scope_peak_skipped);
+            (void)reply(out);
+            return;
+        }
+        s_scope_peak_buffer[index] = word;
+    }
+    bytes = record.bytes;
     for (channel = 0U; channel < 4U; ++channel) {
         win[channel] = Xil_In32(PD_FEATURE_BASE + PD_FEATURE_CFG0(channel)) >> 16;
         if (Xil_In32(PD_FEATURE_BASE + PD_FEATURE_STATUS(channel)) & 1U)
             lock_mask |= 1U << channel;
     }
     (void)snprintf(out, sizeof(out),
-        "PEAKS V1 seq=%lu total=%lu count=%lu bytes=%lu crc32=%08lx wins=%lu,%lu,%lu,%lu lock=%lx\r\n",
-        (unsigned long)sequence, (unsigned long)total, (unsigned long)selected,
+        "PEAKS V2 seq=%lu total=%lu words=%lu bytes=%lu crc32=%08lx wins=%lu,%lu,%lu,%lu lock=%lx first=%lu next=%lu gap=%lu skipped=%lu\r\n",
+        (unsigned long)sequence, (unsigned long)peaks,
+        (unsigned long)words_count,
         (unsigned long)bytes,
         (unsigned long)crc32((const u8 *)s_scope_peak_buffer, bytes),
         (unsigned long)win[0], (unsigned long)win[1],
         (unsigned long)win[2], (unsigned long)win[3],
-        (unsigned long)lock_mask);
+        (unsigned long)lock_mask, (unsigned long)first, (unsigned long)next,
+        (unsigned long)gap, (unsigned long)s_scope_peak_skipped);
     if (reply(out) != 0) return;
     if (bytes == 0U) return;
     s_transfer.addr = (UINTPTR)s_scope_peak_buffer;
@@ -1172,6 +1393,142 @@ static void reply_scope_phase(void)
     (void)reply(out);
 }
 
+/* Start an asynchronous full-cycle envelope job.  The heavy 520k-sample
+ * reduction is deliberately performed by pd_tcp_service_poll(), in bounded
+ * chunks, so the lwIP receive callback never monopolizes the acquisition loop. */
+static void start_scope_envelope(void)
+{
+    pd_snapshot_record_t snapshot;
+    u32 next;
+    u32 channel;
+
+    if (!s_scope.enabled) {
+        (void)reply("ERR SCOPE is off; send SCOPE ON [samples] first\r\n");
+        return;
+    }
+    if (pd_acq_state() != PD_ACQ_RUNNING) {
+        (void)reply("ERR SCOPE ENVELOPE requires a running acquisition\r\n");
+        return;
+    }
+    if (s_transfer.active || s_scope_envelope.active || s_scope_envelope.ready) {
+        (void)reply("ERR SCOPE transfer is still active\r\n");
+        return;
+    }
+    next = g_pd_acq.snapshot_sequence;
+    if (next == 0U ||
+        pd_acq_get_snapshot_by_sequence(next - 1U, &snapshot) != XST_SUCCESS ||
+        snapshot.archive_addr == 0U ||
+        snapshot.bytes != PD_SCOPE_CYCLE_SAMPLES * PD_SCOPE_SAMPLE_BYTES) {
+        (void)reply("SCOPE_ENV NONE reason=not_ready\r\n");
+        return;
+    }
+
+    memset(&s_scope_envelope, 0, sizeof(s_scope_envelope));
+    s_scope_envelope.snapshot_sequence = snapshot.sequence;
+    s_scope_envelope.snapshot_bytes = snapshot.bytes;
+    s_scope_envelope.snapshot_addr = snapshot.archive_addr;
+    s_scope_envelope.sample_count = snapshot.bytes / PD_SCOPE_SAMPLE_BYTES;
+    for (channel = 0U; channel < PD_SCOPE_ENV_CHANNELS; ++channel) {
+        if (Xil_In32(PD_FEATURE_BASE + PD_FEATURE_STATUS(channel)) & 1U)
+            s_scope_envelope.lock_mask |= 1U << channel;
+    }
+    Xil_DCacheInvalidateRange((UINTPTR)snapshot.archive_addr, snapshot.bytes);
+    s_scope_envelope.active = 1U;
+}
+
+static void finish_scope_envelope_bin(u32 bin)
+{
+    u32 channel;
+    u32 offset = bin * PD_SCOPE_ENV_CHANNELS * 4U;
+    for (channel = 0U; channel < PD_SCOPE_ENV_CHANNELS; ++channel) {
+        const u16 lo = (u16)s_scope_envelope.minimum[bin][channel];
+        const u16 hi = (u16)s_scope_envelope.maximum[bin][channel];
+        s_scope_envelope.payload[offset++] = (u8)(lo & 0xFFU);
+        s_scope_envelope.payload[offset++] = (u8)(lo >> 8);
+        s_scope_envelope.payload[offset++] = (u8)(hi & 0xFFU);
+        s_scope_envelope.payload[offset++] = (u8)(hi >> 8);
+    }
+}
+
+static void scope_envelope_step(void)
+{
+    pd_snapshot_record_t current;
+    const u8 *raw;
+    u32 budget = PD_SCOPE_ENV_STEP_SAMPLES;
+    char out[192];
+
+    if (s_scope_envelope.active) {
+        if (s_client == NULL ||
+            pd_acq_get_snapshot_by_sequence(s_scope_envelope.snapshot_sequence,
+                                             &current) != XST_SUCCESS ||
+            current.archive_addr != s_scope_envelope.snapshot_addr ||
+            current.bytes != s_scope_envelope.snapshot_bytes) {
+            s_scope_envelope.active = 0U;
+            if (s_client != NULL)
+                (void)reply("SCOPE_ENV SKIP reason=snapshot_overwritten\r\n");
+            return;
+        }
+        raw = (const u8 *)(UINTPTR)s_scope_envelope.snapshot_addr;
+        while (budget != 0U && s_scope_envelope.bin_cursor < PD_SCOPE_ENV_BINS) {
+            const u32 bin = s_scope_envelope.bin_cursor;
+            const u32 bin_start = (bin * s_scope_envelope.sample_count) /
+                                  PD_SCOPE_ENV_BINS;
+            const u32 bin_end = ((bin + 1U) * s_scope_envelope.sample_count) /
+                                PD_SCOPE_ENV_BINS;
+            if (s_scope_envelope.sample_cursor == bin_start) {
+                u32 channel;
+                for (channel = 0U; channel < PD_SCOPE_ENV_CHANNELS; ++channel) {
+                    s_scope_envelope.minimum[bin][channel] = SHRT_MAX;
+                    s_scope_envelope.maximum[bin][channel] = SHRT_MIN;
+                }
+            }
+            while (budget != 0U && s_scope_envelope.sample_cursor < bin_end) {
+                const u8 *p = raw + s_scope_envelope.sample_cursor * PD_SCOPE_SAMPLE_BYTES;
+                const s16 sample[PD_SCOPE_ENV_CHANNELS] = {
+                    (s16)((u16)p[0] | ((u16)(p[1] & 0x0FU) << 8)) - 2048,
+                    (s16)(((u16)p[1] >> 4) | ((u16)p[2] << 4)) - 2048,
+                    (s16)((u16)p[3] | ((u16)(p[4] & 0x0FU) << 8)) - 2048,
+                    (s16)(((u16)p[4] >> 4) | ((u16)p[5] << 4)) - 2048
+                };
+                u32 channel;
+                for (channel = 0U; channel < PD_SCOPE_ENV_CHANNELS; ++channel) {
+                    if (sample[channel] < s_scope_envelope.minimum[bin][channel])
+                        s_scope_envelope.minimum[bin][channel] = sample[channel];
+                    if (sample[channel] > s_scope_envelope.maximum[bin][channel])
+                        s_scope_envelope.maximum[bin][channel] = sample[channel];
+                }
+                ++s_scope_envelope.sample_cursor;
+                --budget;
+            }
+            if (s_scope_envelope.sample_cursor == bin_end) {
+                finish_scope_envelope_bin(bin);
+                ++s_scope_envelope.bin_cursor;
+            }
+        }
+        if (s_scope_envelope.bin_cursor == PD_SCOPE_ENV_BINS) {
+            (void)snprintf(s_scope_envelope.header, sizeof(s_scope_envelope.header),
+                "SCOPE_ENV V1 seq=%lu snap_seq=%lu samples=%lu bins=%u bytes=%u fs=26000000 lock=%lx phase=cycle_start crc32=%08lx\r\n",
+                (unsigned long)s_scope.sequence++,
+                (unsigned long)s_scope_envelope.snapshot_sequence,
+                (unsigned long)s_scope_envelope.sample_count,
+                PD_SCOPE_ENV_BINS, PD_SCOPE_ENV_BYTES,
+                (unsigned long)s_scope_envelope.lock_mask,
+                (unsigned long)crc32(s_scope_envelope.payload, PD_SCOPE_ENV_BYTES));
+            s_scope_envelope.active = 0U;
+            s_scope_envelope.ready = 1U;
+        }
+    }
+    if (s_scope_envelope.ready && s_client != NULL && !s_transfer.active &&
+        reply(s_scope_envelope.header) == 0) {
+        s_transfer.addr = (UINTPTR)s_scope_envelope.payload;
+        s_transfer.offset = 0U;
+        s_transfer.remaining = PD_SCOPE_ENV_BYTES;
+        s_transfer.invalidate_cache = 0U;
+        s_transfer.active = 1U;
+        s_scope_envelope.ready = 0U;
+    }
+}
+
 static void start_scope(char *line)
 {
     char *p = line + 5;
@@ -1179,11 +1536,36 @@ static void start_scope(char *line)
     while (*p == ' ') ++p;
     if (strncmp(p, "OFF", 3) == 0 && p[3] == 0) {
         s_scope.enabled = 0U;
+        s_scope.last_frame_valid = 0U;
         (void)reply("OK SCOPE OFF\r\n");
         return;
     }
     if (strncmp(p, "NEXT", 4) == 0 && p[4] == 0) {
         start_scope_frame();
+        return;
+    }
+    if (strncmp(p, "ENVELOPE", 8) == 0 && p[8] == 0) {
+        start_scope_envelope();
+        return;
+    }
+    if (strncmp(p, "FFT ", 4) == 0) {
+        start_scope_fft(p + 4);
+        return;
+    }
+    if (strncmp(p, "EVENT SEQ ", 10) == 0) {
+        char *cursor = p + 10;
+        u32 event_sequence, event_samples = s_scope.samples;
+        if (parse_one_or_two_u32(cursor, &event_sequence, &event_samples) != 0) {
+            (void)reply("ERR usage: SCOPE EVENT SEQ sequence [samples]\r\n");
+            return;
+        }
+        if (event_samples == 0U) event_samples = s_scope.samples;
+        if (event_samples < 256U || event_samples > PD_SCOPE_MAX_SAMPLES ||
+            (event_samples % 4U) != 0U) {
+            (void)reply("ERR SCOPE samples must be 256..2048 and divisible by 4\r\n");
+            return;
+        }
+        start_scope_event(event_sequence, event_samples);
         return;
     }
     if (strncmp(p, "PEAKS", 5) == 0 && p[5] == 0) {
@@ -1195,7 +1577,7 @@ static void start_scope(char *line)
         return;
     }
     if (strncmp(p, "ON", 2) != 0 || (p[2] != 0 && p[2] != ' ')) {
-        (void)reply("ERR usage: SCOPE ON [samples] | NEXT | PEAKS | PHASE | OFF\r\n");
+        (void)reply("ERR usage: SCOPE ON [samples] | NEXT | ENVELOPE | FFT CHANNEL channel(0..3) | EVENT SEQ n [samples] | PEAKS | PHASE | OFF\r\n");
         return;
     }
     p += 2;
@@ -1207,8 +1589,13 @@ static void start_scope(char *line)
     }
     s_scope.enabled = 1U;
     s_scope.samples = samples;
-    s_scope.peak_cursor = g_pd_acq.event_sequence > 4U ?
-                          g_pd_acq.event_sequence - 4U : 0U;
+    s_scope.last_frame_valid = 0U;
+    {
+        const u32 next = g_pd_acq.event_sequence;
+        s_scope.peak_cursor = next > PD_EVENT_ARCHIVE_COUNT ?
+                              next - PD_EVENT_ARCHIVE_COUNT : 0U;
+        s_scope_peak_skipped = 0U;
+    }
     {
         char out[96];
         (void)snprintf(out, sizeof(out),
@@ -1313,9 +1700,10 @@ static void start_get(char *line)
 static void execute_command(char *line)
 {
     u32 value;
-    if (s_transfer.active) return; /* Never interleave text and raw payload. */
+    if (s_transfer.active || s_scope_envelope.active || s_scope_envelope.ready)
+        return; /* Never interleave text and raw payload/job response. */
     if (strcmp(line, "HELP") == 0) {
-        (void)reply("CMD: START [n] | STOP | STATUS | CONFIG | SCOPE ON [samples]|NEXT|PEAKS|PHASE|OFF | REPORT | SET LIMIT n | SET FFTFS hz | SET ALERT DELTA n|MASK n | ALERT CONFIG|SWEEP n|SNAP SEQ n | RECOVER | CATALOG | EVENT n|SEQ n|DETAIL n|DETAIL SEQ n | PRPD SUMMARY|BINS ch first [count] | SNAP n|SEQ n | ANALYZE SNAP n|SEQ n | FFT CONFIG|SELFTEST|SNAP n|SEQ n [start]|AUTO SNAP n|SEQ n | SPECTRUM [AUTO] SNAP n|SEQ n [start] | ANALYSIS n|SNAP SEQ n|CATALOG | SWEEP AUTO SNAP n|SEQ n|CATALOG|INDEX n|WINDOW n 0..4|SNAP SEQ n | FEATURE SWEEP n|SNAP SEQ n | BATCH AUTO | GET EVENT|SNAP n|SEQ n offset bytes | CLEAR\r\n");
+        (void)reply("CMD: START [n] | STOP | STATUS | CONFIG | SCOPE ON [samples]|NEXT|ENVELOPE|FFT CHANNEL n(0..3)|EVENT SEQ n [samples]|PEAKS|PHASE|OFF | REPORT | SET LIMIT n | SET FFTFS hz | SET ALERT DELTA n|MASK n | ALERT CONFIG|SWEEP n|SNAP SEQ n | RECOVER | CATALOG | EVENT n|SEQ n|DETAIL n|DETAIL SEQ n | PRPD SUMMARY|BINS ch first [count] | SNAP n|SEQ n | ANALYZE SNAP n|SEQ n | FFT CONFIG|SELFTEST|SNAP n|SEQ n [start]|AUTO SNAP n|SEQ n | SPECTRUM [AUTO] SNAP n|SEQ n [start] | ANALYSIS n|SNAP SEQ n|CATALOG | SWEEP AUTO SNAP n|SEQ n|CATALOG|INDEX n|WINDOW n 0..4|SNAP SEQ n | FEATURE SWEEP n|SNAP SEQ n | BATCH AUTO | GET EVENT|SNAP n|SEQ n offset bytes | CLEAR\r\n");
     } else if (strncmp(line, "START", 5) == 0 && (line[5] == 0 || line[5] == ' ')) {
         if (pd_acq_state() != PD_ACQ_IDLE) (void)reply("ERR already running\r\n");
         else if (pd_acq_start(parse_u32(line + 5, pd_acq_default_packet_limit())) == XST_SUCCESS)
@@ -1443,6 +1831,8 @@ static err_t receive_cb(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t er
         if (s_client == pcb) s_client = NULL;
         s_transfer.active = 0U;
         s_scope.enabled = 0U;
+        s_scope_envelope.active = 0U;
+        s_scope_envelope.ready = 0U;
         (void)tcp_close(pcb);
         return ERR_OK;
     }
@@ -1472,6 +1862,8 @@ static void error_cb(void *arg, err_t err)
     s_line_len = 0U;
     s_transfer.active = 0U;
     s_scope.enabled = 0U;
+    s_scope_envelope.active = 0U;
+    s_scope_envelope.ready = 0U;
 }
 
 static err_t accept_cb(void *arg, struct tcp_pcb *pcb, err_t err)
@@ -1508,5 +1900,6 @@ void pd_tcp_service_poll(void)
     if (TcpFastTmrFlag) { tcp_fasttmr(); TcpFastTmrFlag = 0; }
     if (TcpSlowTmrFlag) { tcp_slowtmr(); TcpSlowTmrFlag = 0; }
     xemacif_input(&echo_netif);
+    scope_envelope_step();
     transfer_pump();
 }

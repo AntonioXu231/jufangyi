@@ -10,7 +10,8 @@
 //   + AXI4-Lite slave(s_axi_*) + AXI4-Stream master(m_axis_*) + irq
 //
 // 数据流:
-//   ADC(SAMPLE_HZ, adc_clk 域) -> [pd_adc_cdc x4](SAMPLE_HZ->CLK_HZ CDC, 12bit)
+//   ADC(SAMPLE_HZ, adc_clk 域) -> INPUT_CDC=0 公共 CDC 旁路；=1 四路独立 CDC；
+//                                 =2 四通道 48-bit 原子 CDC
 //        -> pd_feature_top (峰值/1024 相位窗/n·I·P·Q/PRPD/8B 事件包)
 //        -> M_AXIS (事件流, type=0x00/0x01) / AXI-Lite (配置与状态)
 //
@@ -30,8 +31,9 @@ module pd_feature_sys_top #(
     parameter integer ADC_W     = `PD_ADC_W,
     parameter integer CLK_HZ    = 130000000,   // 系统时钟 (Hz), PL 主时钟
     parameter integer SAMPLE_HZ = 26000000,    // ADC 采样率 (Hz), 必须整除 CLK_HZ
-    // 0: adc_data/adc_dv 已由上游公共 CDC 送入 clk 域。
-    // 1: 保持兼容原有独立通道 adc_clk -> clk CDC 架构。
+    // 0: adc_data/adc_dv 已由上游公共 CDC 送入 clk 域（当前工程配置）。
+    // 1: 兼容旧的四路独立 adc_clk -> clk CDC。
+    // 2: 四通道同一 48-bit FIFO 原子 CDC，供直接 ADC 时钟域输入使用。
     parameter integer INPUT_CDC = 1
 )(
     // ================= 时钟 / 复位 =================
@@ -118,16 +120,22 @@ module pd_feature_sys_top #(
     // =========================================================================
     // clk 域样本流
     //
-    // INPUT_CDC=0 用于统一采集架构：pd_pack48 在 ADC 域完成一次四通道
+    // INPUT_CDC=0 用于统一采集架构：上游 pd_pack48/公共 FIFO 已在 ADC 域完成四通道
     // 对齐，随后由公共 48-bit FIFO 把 Path-B 送到这里。这样特征链不再对
     // 四通道分别做 CDC，避免各通道 FIFO 空标志独立同步造成的样本错位。
     // =========================================================================
     wire [NUM_CH*ADC_W-1:0] adc_100;
     wire [NUM_CH-1:0]       adc_dv_100;
+    wire                    cdc_fifo_ovf, cdc_channel_skew;
 
     genvar i;
     generate
-        if (INPUT_CDC != 0) begin : G_ADC_CDC
+        if (INPUT_CDC == 0) begin : G_ALREADY_SYNCHRONIZED
+            assign adc_100          = adc_data;
+            assign adc_dv_100       = adc_dv;
+            assign cdc_fifo_ovf     = 1'b0;
+            assign cdc_channel_skew = 1'b0;
+        end else if (INPUT_CDC == 1) begin : G_ADC_CDC
             // rst_n is generated in the 130 MHz PL domain. The ADC clock is
             // independent, so release its reset only after two adc_clk edges.
             (* ASYNC_REG = "TRUE" *) reg [1:0] adc_rst_sync;
@@ -152,9 +160,26 @@ module pd_feature_sys_top #(
                     .adc_dv_100   (adc_dv_100[i])
                 );
             end
-        end else begin : G_CLK_DOMAIN_INPUT
-            assign adc_100    = adc_data;
-            assign adc_dv_100 = adc_dv;
+            assign cdc_fifo_ovf     = 1'b0;
+            assign cdc_channel_skew = 1'b0;
+        end else begin : G_PACKED_CDC
+            pd_adc_pack_cdc #(
+                .CH_NUM    (NUM_CH),
+                .ADC_W     (ADC_W),
+                .DEPTH     (256),
+                .CLK_HZ    (CLK_HZ),
+                .SAMPLE_HZ (SAMPLE_HZ)
+            ) u_packed_cdc (
+                .adc_clk       (adc_clk),
+                .clk           (clk),
+                .rst_n         (rst_n),
+                .adc_data      (adc_data),
+                .adc_dv        (adc_dv),
+                .adc_data_clk  (adc_100),
+                .adc_dv_clk    (adc_dv_100),
+                .fifo_overflow (cdc_fifo_ovf),
+                .channel_skew  (cdc_channel_skew)
+            );
         end
     endgenerate
 
@@ -169,7 +194,8 @@ module pd_feature_sys_top #(
         .EV_W                 (`PD_EV_W),
         .FIFO_AW              (8),
         .C_S_AXI_DATA_WIDTH   (32),
-        .C_S_AXI_ADDR_WIDTH   (16)
+        .C_S_AXI_ADDR_WIDTH   (16),
+        .SAMPLE_HZ            (SAMPLE_HZ)
     ) u_feat (
         .clk           (clk),
         .rst_n         (rst_n),
@@ -177,6 +203,9 @@ module pd_feature_sys_top #(
         .adc_data      (adc_100),
         .adc_dv        (adc_dv_100),
         .sync_in       (sync_in),
+        .i_otr         ({NUM_CH{1'b0}}),
+        .i_fifo_ovf    (cdc_fifo_ovf),
+        .i_fifo_skew   (cdc_channel_skew),
 
         .s_axi_awaddr  (s_axi_awaddr),
         .s_axi_awprot  (s_axi_awprot),

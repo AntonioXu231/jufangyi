@@ -2,7 +2,7 @@
 // pd_feature_top.v  --  多通道局部放电特征提取 IP 顶层
 // -----------------------------------------------------------------------------
 // 数据流:
-//   ADC(4ch x 12bit @20MSPS)
+//   ADC(4ch x 12bit @SAMPLE_HZ; current board configuration is 26MSPS)
 //     -> pd_feature_core  分段峰值提取 / 1024 相位窗 / n,I,P,Q 统计 / PRPD 写
 //     -> pd_axis_fifo     突发平滑
 //     -> pd_axis_arb      帧级轮询仲裁
@@ -11,8 +11,8 @@
 //
 // =============================================================================
 // 【重要】时钟域说明
-//   本版本为单时钟设计: S_AXI_ACLK / clk / 事件流共用同一个 PL 时钟(典型
-//   100MHz), ADC 侧以 adc_dv 脉冲表示 20MSPS 样本有效。
+//   本版本为单时钟设计: S_AXI_ACLK / clk / 事件流共用同一个 PL 时钟(当前
+//   130MHz), ADC 侧以 adc_dv 脉冲表示 SAMPLE_HZ 样本有效。
 //   接入真实 ADS805E 时, 其输出随 20MHz 采样时钟变化, 与本模块时钟异步。
 //   此时需在 ADC 前端为每个通道插入一级异步 FIFO(xpm_fifo_async 或
 //   FIFO Generator, 深度 >= 64, 独立读写时钟), 读侧用本时钟产生 adc_dv。
@@ -29,7 +29,8 @@ module pd_feature_top #(
     parameter integer EV_W                 = `PD_EV_W,
     parameter integer FIFO_AW              = 8,          // 每通道事件 FIFO 深度 = 256
     parameter integer C_S_AXI_DATA_WIDTH   = 32,
-    parameter integer C_S_AXI_ADDR_WIDTH   = 16
+    parameter integer C_S_AXI_ADDR_WIDTH   = 16,
+    parameter integer SAMPLE_HZ            = 26000000
 )(
     // ================= 时钟 / 复位 =================
     input  wire                            clk,
@@ -41,6 +42,9 @@ module pd_feature_top #(
 
     // ================= 同步输入 =================
     input  wire                            sync_in,      // 50~400Hz 整形后方波
+    input  wire [NUM_CH-1:0]               i_otr,
+    input  wire                            i_fifo_ovf,
+    input  wire                            i_fifo_skew,
 
     // ================= AXI4-Lite Slave =================
     input  wire [C_S_AXI_ADDR_WIDTH-1:0]   s_axi_awaddr,
@@ -94,6 +98,7 @@ module pd_feature_top #(
     wire [32*NUM_CH-1:0]     w_reg0_q, w_reg1_q;
 
     wire [NUM_CH-1:0]        w_sync_locked, w_meas_done, w_overflow;
+    wire [NUM_CH-1:0]        w_dc_mode, w_pm_cycle_start, w_pm_freq_ok, w_pm_sync_lost;
     wire [NUM_CH-1:0]        w_frame_ack;
     wire [NUM_CH-1:0]        w_frame_ovf_ack;   // v3.0: FRAME_ACK[1] 清 overflow
     wire [NUM_CH-1:0]        w_apply_done;      // v3.0: 各通道 apply 完成脉冲
@@ -103,6 +108,9 @@ module pd_feature_top #(
     wire [192*NUM_CH-1:0]    w_pos_cnt, w_neg_cnt;
     wire [32*NUM_CH-1:0]     w_frame_n_pos, w_frame_n_neg, w_frame_id;
     wire [16*NUM_CH-1:0]     w_frame_ad_max, w_frame_ad_min;
+    wire [16*NUM_CH-1:0]     w_ad_max, w_ad_min;
+    wire [32*NUM_CH-1:0]     w_pm_period, w_pm_meas_cnt, w_cycle_idx;
+    wire                     w_sync_edge;
     wire [2*NUM_CH-1:0]      w_frame_stat;
 
     wire [PH_W-1:0]          w_prpd_ps_addr;
@@ -123,6 +131,14 @@ module pd_feature_top #(
 
     wire [NUM_CH-1:0]        core_rst_n;
 
+    pd_sync_pulse u_sync_pulse (
+        .clk         (clk),
+        .rst_n       (rst_n),
+        .sync_in     (sync_in),
+        .sync_level  (),
+        .cycle_start (w_sync_edge)
+    );
+
     // =========================================================================
     // 复位: 全局复位 | 全局软复位 | 每通道软复位脉冲
     // 注意: rst_n 是 1bit, 必须显式复制成 NUM_CH 位, 否则 Verilog 会按零扩展
@@ -139,7 +155,8 @@ module pd_feature_top #(
         .C_S_AXI_DATA_WIDTH (C_S_AXI_DATA_WIDTH),
         .C_S_AXI_ADDR_WIDTH (C_S_AXI_ADDR_WIDTH),
         .NUM_CH             (NUM_CH),
-        .PH_W               (PH_W)
+        .PH_W               (PH_W),
+        .SAMPLE_HZ          (SAMPLE_HZ)
     ) u_regs (
         .S_AXI_ACLK     (clk),
         .S_AXI_ARESETN  (rst_n),
@@ -162,6 +179,7 @@ module pd_feature_top #(
         .S_AXI_RREADY   (s_axi_rready),
 
         .o_enable       (w_enable),
+        .o_dc_mode      (w_dc_mode),
         .o_sw_rst       (w_sw_rst),
         .o_prpd_clear   (w_prpd_clear),
         .o_mode         (w_mode),
@@ -185,6 +203,14 @@ module pd_feature_top #(
         .o_pos_thr      (w_pos_thr), .o_neg_thr(w_neg_thr), .o_apply(w_apply),
 
         .i_sync_locked  (w_sync_locked),
+        .i_cycle_idx    (w_cycle_idx),
+        .i_ad_max       (w_ad_max),
+        .i_ad_min       (w_ad_min),
+        .i_sync_meas_cnt(w_pm_meas_cnt),
+        .i_sync_lost    (w_pm_sync_lost),
+        .i_otr          (i_otr),
+        .i_fifo_ovf     (i_fifo_ovf),
+        .i_fifo_skew    (i_fifo_skew),
         .i_meas_done    (w_meas_done),
         .i_overflow     (w_overflow),
         .i_sync_period  (w_sync_period),
@@ -220,6 +246,21 @@ module pd_feature_top #(
     generate
         for (i = 0; i < NUM_CH; i = i + 1) begin : GEN_CH
 
+            pd_period_manager #(
+                .SAMPLE_HZ (SAMPLE_HZ)
+            ) u_period_manager (
+                .clk          (clk),
+                .rst_n        (core_rst_n[i]),
+                .ac_mode      (~w_dc_mode[i]),
+                .dv           (adc_dv[i]),
+                .sync_edge    (w_sync_edge),
+                .cycle_start  (w_pm_cycle_start[i]),
+                .sync_lost    (w_pm_sync_lost[i]),
+                .period       (w_pm_period[32*i +: 32]),
+                .freq_ok      (w_pm_freq_ok[i]),
+                .meas_cnt     (w_pm_meas_cnt[32*i +: 32])
+            );
+
             // core 与 PRPD RAM 之间的本地互联
             wire [PH_W-1:0]   prpd_addr_l;
             wire [15:0]       prpd_wdata_l;
@@ -233,7 +274,8 @@ module pd_feature_top #(
                 .ADC_W    (ADC_W),
                 .PH_W     (PH_W),
                 .TS_W     (TS_W),
-                .EV_W     (EV_W)
+                .EV_W     (EV_W),
+                .SAMPLE_HZ(SAMPLE_HZ)
             ) u_core (
                 .clk             (clk),
                 .rst_n           (core_rst_n[i]),
@@ -241,6 +283,10 @@ module pd_feature_top #(
                 .adc_data        (adc_data[i*ADC_W +: ADC_W]),
                 .adc_dv          (adc_dv[i]),
                 .sync_in         (sync_in),
+                .pm_cycle_start  (w_pm_cycle_start[i]),
+                .pm_period       (w_pm_period[32*i +: 32]),
+                .pm_freq_ok      (w_pm_freq_ok[i]),
+                .pm_sync_lost    (w_pm_sync_lost[i]),
 
                 .cfg_enable      (w_enable[i]),
                 .cfg_mode        (w_mode[2*i +: 2]),
@@ -277,6 +323,9 @@ module pd_feature_top #(
 
                 .st_sync_period  (w_sync_period[32*i +: 32]),
                 .st_sync_locked  (w_sync_locked[i]),
+                .st_cycle_idx    (w_cycle_idx[32*i +: 32]),
+                .st_ad_max       (w_ad_max[16*i +: 16]),
+                .st_ad_min       (w_ad_min[16*i +: 16]),
                 .st_sn_n         (w_n[32*i +: 32]),
                 .st_sn_qmax      (w_qmax[32*i +: 32]),
                 .st_sn_sum_abs_q (w_sum_abs_q[64*i +: 64]),

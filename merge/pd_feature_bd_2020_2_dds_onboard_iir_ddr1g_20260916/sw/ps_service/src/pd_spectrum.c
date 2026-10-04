@@ -169,6 +169,61 @@ int pd_spectrum_analyze(const void *raw, u32 bytes, u32 start_sample,
     return XST_SUCCESS;
 }
 
+int pd_spectrum_analyze_channel(const void *raw, u32 bytes, u32 start_sample,
+                                u32 sample_rate_hz, u32 channel,
+                                u16 bins[PD_FFT_POINTS / 2U + 1U],
+                                pd_spectrum_channel_t *result)
+{
+    pd_complex_q15_t data[PD_FFT_POINTS];
+    u16 sample[PD_SNAPSHOT_CHANNELS];
+    s64 sum = 0;
+    u64 power, band_power = 0U;
+    u32 total_samples, i, bin, peak_bin = 1U, peak_amplitude = 0U;
+    s32 dc;
+
+    if (raw == 0 || result == 0 || sample_rate_hz == 0U ||
+        channel >= PD_SNAPSHOT_CHANNELS || bytes == 0U ||
+        (bytes % PD_SNAPSHOT_BLOCK_BYTES) != 0U)
+        return XST_FAILURE;
+    total_samples = bytes / PD_SNAPSHOT_BYTES_PER_SAMPLE;
+    if (start_sample > total_samples ||
+        PD_FFT_POINTS > total_samples - start_sample)
+        return XST_FAILURE;
+
+    for (i = 0U; i < PD_FFT_POINTS; ++i) {
+        if (pd_snapshot_read_sample(raw, bytes, start_sample + i, sample) != XST_SUCCESS)
+            return XST_FAILURE;
+        sum += sample[channel];
+    }
+    dc = (s32)(sum / PD_FFT_POINTS);
+    for (i = 0U; i < PD_FFT_POINTS; ++i) {
+        (void)pd_snapshot_read_sample(raw, bytes, start_sample + i, sample);
+        data[i].re = q15_mul((s32)sample[channel] - dc, hann_q15(i));
+        data[i].im = 0;
+    }
+    fft_forward(data);
+
+    if (bins != 0) bins[0] = 0U;
+    for (bin = 1U; bin <= PD_FFT_POINTS / 2U; ++bin) {
+        u32 amplitude;
+        power = (u64)((s64)data[bin].re * data[bin].re) +
+                (u64)((s64)data[bin].im * data[bin].im);
+        band_power += power;
+        amplitude = isqrt_u64(power) * 4U;
+        if (bins != 0) bins[bin] = amplitude > 0xFFFFU ? 0xFFFFU : (u16)amplitude;
+        if (amplitude > peak_amplitude) {
+            peak_amplitude = amplitude;
+            peak_bin = bin;
+        }
+    }
+    result->dc_code = (u32)dc;
+    result->peak_bin = peak_bin;
+    result->peak_hz = (u32)(((u64)peak_bin * sample_rate_hz) / PD_FFT_POINTS);
+    result->amplitude_code = peak_amplitude;
+    result->band_power = band_power;
+    return XST_SUCCESS;
+}
+
 int pd_spectrum_find_peak_window(const void *raw, u32 bytes,
                                  pd_spectrum_window_t *window)
 {
