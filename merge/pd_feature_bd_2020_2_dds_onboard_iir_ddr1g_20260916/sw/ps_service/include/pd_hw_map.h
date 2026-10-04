@@ -11,16 +11,40 @@
 #include "xil_types.h"
 
 #if defined(XPAR_PD_DDR_0_BASEADDR)
+# if XPAR_PD_DDR_0_BASEADDR != 0x40000000U
+#  error "pd_ddr AXI-Lite base changed: update and review the PS hardware map"
+# endif
+# if defined(XPAR_PD_DDR_0_HIGHADDR) && XPAR_PD_DDR_0_HIGHADDR != 0x4000FFFFU
+#  error "pd_ddr AXI-Lite range changed: update and review the PS hardware map"
+# endif
 # define PD_DDR_BASE ((UINTPTR)XPAR_PD_DDR_0_BASEADDR)
 #elif defined(XPAR_PD_DDR_BD_ADAPTER_0_BASEADDR)
+# if XPAR_PD_DDR_BD_ADAPTER_0_BASEADDR != 0x40000000U
+#  error "pd_ddr AXI-Lite base changed: update and review the PS hardware map"
+# endif
+# if defined(XPAR_PD_DDR_BD_ADAPTER_0_HIGHADDR) && XPAR_PD_DDR_BD_ADAPTER_0_HIGHADDR != 0x4000FFFFU
+#  error "pd_ddr AXI-Lite range changed: update and review the PS hardware map"
+# endif
 # define PD_DDR_BASE ((UINTPTR)XPAR_PD_DDR_BD_ADAPTER_0_BASEADDR)
 #else
 # error "Cannot find pd_ddr AXI-Lite base address in xparameters.h"
 #endif
 
 #if defined(XPAR_PD_FEATURE_0_BASEADDR)
+# if XPAR_PD_FEATURE_0_BASEADDR != 0x40010000U
+#  error "pd_feature AXI-Lite base changed: update and review the PS hardware map"
+# endif
+# if defined(XPAR_PD_FEATURE_0_HIGHADDR) && XPAR_PD_FEATURE_0_HIGHADDR != 0x4001FFFFU
+#  error "pd_feature AXI-Lite range changed: update and review the PS hardware map"
+# endif
 # define PD_FEATURE_BASE ((UINTPTR)XPAR_PD_FEATURE_0_BASEADDR)
 #elif defined(XPAR_PD_FEATURE_SYS_TOP_0_BASEADDR)
+# if XPAR_PD_FEATURE_SYS_TOP_0_BASEADDR != 0x40010000U
+#  error "pd_feature AXI-Lite base changed: update and review the PS hardware map"
+# endif
+# if defined(XPAR_PD_FEATURE_SYS_TOP_0_HIGHADDR) && XPAR_PD_FEATURE_SYS_TOP_0_HIGHADDR != 0x4001FFFFU
+#  error "pd_feature AXI-Lite range changed: update and review the PS hardware map"
+# endif
 # define PD_FEATURE_BASE ((UINTPTR)XPAR_PD_FEATURE_SYS_TOP_0_BASEADDR)
 #else
 # error "Cannot find pd_feature AXI-Lite base address in xparameters.h"
@@ -28,6 +52,7 @@
 
 /* pd_feature channel i occupies a 0x80-byte register page. */
 #define PD_FEATURE_CFG0(ch)   ((u32)(ch) * 0x80U + 0x04U)
+#define PD_FEATURE_SCALE(ch)  ((u32)(ch) * 0x80U + 0x10U)
 #define PD_FEATURE_STATUS(ch) ((u32)(ch) * 0x80U + 0x20U)
 
 #if defined(XPAR_XAXIDMA_0_BASEADDR)
@@ -41,8 +66,10 @@
 #endif
 
 #if defined(XPAR_PS7_DDR_0_BASEADDRESS)
+# define PD_PS_DDR_BASE_ADDRESS XPAR_PS7_DDR_0_BASEADDRESS
 # define PD_PS_DDR_BASE XPAR_PS7_DDR_0_BASEADDRESS
 #elif defined(XPAR_PS7_DDR_0_S_AXI_BASEADDR)
+# define PD_PS_DDR_BASE_ADDRESS XPAR_PS7_DDR_0_S_AXI_BASEADDR
 # define PD_PS_DDR_BASE XPAR_PS7_DDR_0_S_AXI_BASEADDR
 #else
 # error "No PS DDR base macro in xparameters.h"
@@ -98,5 +125,36 @@
 #define PD_SNAP_ARCHIVE_STRIDE   0x00C00000U
 #define PD_SNAP_SLOT_LOW         0x20001000U
 #define PD_SNAP_SLOT_HIGH        0x23001000U
+
+/*
+ * Compile-time layout guards. The PS archive layout is intentionally adjacent:
+ * 4 * 12 MiB of snapshots end exactly where 2048 * 64 KiB events begin.
+ * These constants must track PD_SNAP_ARCHIVE_COUNT / PD_EVENT_ARCHIVE_COUNT.
+ */
+#define PD_SNAP_ARCHIVE_BYTES    0x03000000U
+#define PD_EVENT_ARCHIVE_BYTES   0x08000000U
+#define PD_RX_BUFFER_START_ADDR  (PD_PS_DDR_BASE_ADDRESS + 0x01000000U)
+
+#if (PD_SNAP_ARCHIVE_BASE + PD_SNAP_ARCHIVE_BYTES) != PD_EVENT_ARCHIVE_BASE
+# error "PS SNAP and EVENT archive regions must be adjacent and non-overlapping"
+#endif
+#if (PD_EVENT_ARCHIVE_BASE + PD_EVENT_ARCHIVE_BYTES) > 0x40000000U
+# error "PS EVENT archive exceeds the Zynq-7020 PS DDR address window"
+#endif
+#if (PD_RX_BUFFER_START_ADDR + PD_RX_BUFFER_BYTES) > PD_SNAP_ARCHIVE_BASE
+# error "PS DMA receive buffer overlaps the archive region"
+#endif
+#if PD_SNAP_SLOT_HIGH > PD_SNAP_ARCHIVE_BASE
+# error "PL snapshot slots overlap the PS snapshot archive"
+#endif
+#if defined(XPAR_PS7_DDR_0_HIGHADDRESS)
+# if (PD_EVENT_ARCHIVE_BASE + PD_EVENT_ARCHIVE_BYTES) > (XPAR_PS7_DDR_0_HIGHADDRESS + 1U)
+#  error "PS event archive extends beyond the configured PS DDR range"
+# endif
+#elif defined(XPAR_PS7_DDR_0_S_AXI_HIGHADDR)
+# if (PD_EVENT_ARCHIVE_BASE + PD_EVENT_ARCHIVE_BYTES) > (XPAR_PS7_DDR_0_S_AXI_HIGHADDR + 1U)
+#  error "PS event archive extends beyond the configured PS DDR range"
+# endif
+#endif
 
 #endif /* PD_HW_MAP_H */

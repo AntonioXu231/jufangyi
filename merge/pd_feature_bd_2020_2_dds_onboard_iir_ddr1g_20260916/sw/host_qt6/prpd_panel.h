@@ -65,8 +65,9 @@ private:
     /* 头部偏移：避免 remove(0,n) 的 O(N) 内存搬移。 */
     int m_head = 0;
     int m_count = 0;
-    double m_agingSeconds = 10.0;
-    int m_maximumPoints = 60000;
+    double m_agingSeconds = 15.0;
+    /* 与椭圆面板一致，为高事件率下的 15 s 显示保留空间。 */
+    int m_maximumPoints = 1000000;
     QString m_status;
     QString m_band;
 

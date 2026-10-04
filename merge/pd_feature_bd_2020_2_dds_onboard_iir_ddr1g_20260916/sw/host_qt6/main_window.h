@@ -7,8 +7,8 @@
 
 #include <QByteArray>
 #include <QMainWindow>
+#include <QPointF>
 #include <QQueue>
-#include <QSet>
 #include <QVector>
 
 class ScopeWidget;
@@ -94,6 +94,7 @@ private slots:
     void onPulsePicked(int index, int channel, double code, double timeSec);
     void onEventPicked(int channel, int index, double phaseDeg, double adcCodes, bool positive);
     void flushLog();
+    void flushPrpdDisplay();
 
 private:
     /* PRPD 回合：在取帧间隙借链路读一次事件归档，用于驱动实时相位环。 */
@@ -114,7 +115,9 @@ private:
     void pumpSnapshotGrab();
     void abortSnapshotGrab(const QString &reason);
     void loadSnapshotPlots(const QString &path);
-    void refreshSpectrumFor(const pdsample::WaveformFrame &frame);
+    bool refreshSpectrumFor(const pdsample::WaveformFrame &frame,
+                            bool completesPrpdEvent = false);
+    void finishPsSpectrumRequest(const QString &error = QString());
     void loadEventPrpd(const QString &path);
     void fetchNextPrpdEvent();
     void setArchiveControlsEnabled(bool enabled);
@@ -149,6 +152,17 @@ private:
     QPushButton *m_wholeSnapshotButton = nullptr;
     QComboBox *m_prpdChannel = nullptr;
     PlotWidget *m_spectrumPlot = nullptr;
+    ScopeWidget *m_singleChannelScope = nullptr;
+    QComboBox *m_fftChannelSelector = nullptr;
+    QLabel *m_fftStatus = nullptr;
+    QTimer *m_scopeFftTimeout = nullptr;
+    bool m_scopeFftInFlight = false;
+    bool m_scopeFftOwnsSuspend = false;
+    bool m_scopeFftCompletesPrpdEvent = false;
+    quint32 m_scopeFftExpectedSequence = 0U;
+    quint32 m_scopeFftExpectedChannel = 0U;
+    pdsample::WaveformFrame m_lastScopeFrame;
+    bool m_hasLastScopeFrame = false;
     PlotWidget *m_prpdPlot = nullptr;
     QVector<PrpdPanel *> m_prpdPanels;
     /* 椭圆图谱（参考图那种相位刻度盘 + 竖直脉冲线），四个通道各一个。 */
@@ -161,6 +175,7 @@ private:
     qint64 m_prpdRoundStartMs = 0;
     QCheckBox *m_prpdLiveEnabled = nullptr;
     QSpinBox *m_prpdInterval = nullptr;
+    QTimer *m_prpdDisplayTimer = nullptr;
     QString m_ringStatus;
     /* 归档冻结检测：连续两次 CATALOG 窗口不变说明没有新事件，别继续空转。 */
     quint32 m_lastEventFirst = 0;
@@ -171,12 +186,18 @@ private:
     int m_prpdRoundProbed = 0;
     int m_prpdRoundFetched = 0;
     int m_prpdAddedPoints = 0;
+    bool m_prpdEventWaveRequested = false;
+    bool m_prpdCursorInitialized = false;
+    quint32 m_nextPrpdSequence = 0U;
+    quint32 m_latestPrpdSequence = 0U;
+    quint64 m_prpdSequenceGaps = 0U;
     QLabel *m_ringStats = nullptr;
     bool m_catalogRequestPending = false;
     bool m_eventDownloadInFlight = false;
     quint32 m_eventDownloadSequence = 0xFFFFFFFFU;
     QQueue<quint32> m_prpdEventQueue;
-    QSet<quint32> m_loadedPrpdSequences;
+    QVector<pdsample::PeakEvent> m_pendingEllipseEvents[pdsample::kChannelCount];
+    QVector<QPointF> m_pendingPrpdPoints[pdsample::kChannelCount];
 
     /* ---- 暂停抓快照 ---- */
     QTimer *m_snapshotTimer = nullptr;

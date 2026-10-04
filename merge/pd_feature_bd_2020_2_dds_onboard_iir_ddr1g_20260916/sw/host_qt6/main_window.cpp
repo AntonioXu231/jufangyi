@@ -27,6 +27,7 @@
 #include <QScrollArea>
 #include <QPushButton>
 #include <QRegularExpression>
+#include <QSignalBlocker>
 #include <QSpinBox>
 #include <QFrame>
 #include <QSplitter>
@@ -37,6 +38,7 @@
 #include <QTextStream>
 #include <QThread>
 #include <QTimer>
+#include <QtEndian>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -50,18 +52,11 @@ constexpr double kDefaultSampleRateHz = 26000000.0;
 /* 单个编排阶段的超时。超时就明确报错退出，不无限等待。 */
 constexpr qint64 kStageTimeoutMs = 10000;
 /* PRPD 回合的总超时，防止某次回复丢失后链路被永久让出。 */
-constexpr qint64 kPrpdRoundTimeoutMs = 5000;
-/*
- * 板端日志实测：连续两次 CATALOG 之间 event_seq 前进约 101 条，而归档只有 16 槽。
- * 也就是说一条记录的存活时间只有回合间隔的 ~16%（回合 500 ms 时约 79 ms）。
- * 因此回合策略是"先试最新的、一遇失败就收手"，不做注定失败的补试；
- * 每回合只求一条含峰值的记录就够了（单条 8224 字节记录含约 1027 个峰值字）。
- */
-constexpr int kEventProbeLimit = 3;
+constexpr qint64 kPrpdRoundTimeoutMs = 15000;
+/* 每个 PRPD 回合按序处理最多 32 条，回合之间恢复实时 SCOPE 请求。 */
+constexpr int kEventRecordsPerRound = 32;
 /* 连续两次 CATALOG 窗口不变判定为归档冻结，退避这么久再试，避免空刷链路。 */
 constexpr qint64 kFrozenBackoffMs = 3000;
-/* 单通道单批最多绘制的点数：一条记录就含上千个峰值字，全画会把环糊成实心团。 */
-constexpr int kMaxPointsPerBatchPerChannel = 1200;
 /*
  * 脉冲判据默认值。
  * 绝对阈值 120 码的依据：PD 脉冲增量是 +720/+600/+460/+300 码，而 DDS 背景
@@ -321,9 +316,9 @@ MainWindow::MainWindow()
     m_prpdLiveEnabled->setToolTip(QStringLiteral(
         "在取帧间隙自动读一次事件归档（GET EVENT 在采集运行中板端明确允许），\n"
         "用 PL 的 12-bit 相位字段驱动四通道 360° 环。"));
-    m_prpdInterval = makeSpin(ringBox, 200, 5000, 500, 100);
+    m_prpdInterval = makeSpin(ringBox, 100, 5000, 100, 100);
     m_prpdInterval->setSuffix(QStringLiteral(" ms"));
-    m_ringAging = makeSpin(ringBox, 2, 120, 10, 1);
+    m_ringAging = makeSpin(ringBox, 2, 120, 15, 1);
     m_ringAging->setSuffix(QStringLiteral(" s"));
     m_ringAging->setToolTip(QStringLiteral("环上只保留最近这段时间内的脉冲，形成持续刷新的效果。"));
     auto *refreshRing = new QPushButton(QStringLiteral("立即刷新一次"), ringBox);
@@ -409,7 +404,7 @@ MainWindow::MainWindow()
     m_scaleQ88->setToolTip(QStringLiteral(
         "板端每通道标定系数 SCALE（偏移 0x10，Q8.8）。上电默认 256 = 1.0。\n"
         "默认值只是占位标定，不是真实标定——界面会标出“pC 未标定”。\n"
-        "⚠️ 板端 CONFIG 目前不回传 SCALE，这里需手动与板端一致。"));
+        "CONFIG 会读取板端四通道 SCALE；仅当四路相同才自动同步到此公共显示系数。"));
     pulseGrid->addWidget(m_scaleQ88, 0, column++);
 
     pulseGrid->addWidget(new QLabel(QStringLiteral("脉冲样式"), pulseBox), 0, column++);
@@ -532,9 +527,45 @@ MainWindow::MainWindow()
     m_staticScope = new ScopeWidget(tabs);
     tabs->addTab(m_staticScope, QStringLiteral("归档记录波形（暂停抓取）"));
 
-    /* ===== 页签 3：FFT ===== */
-    m_spectrumPlot = new PlotWidget(tabs);
-    tabs->addTab(m_spectrumPlot, QStringLiteral("1024 点 FFT"));
+    /* ===== 页签 3：单通道实时波形 + PS FFT ===== */
+    auto *singleChannelPage = new QWidget(tabs);
+    auto *singleChannelLayout = new QVBoxLayout(singleChannelPage);
+    auto *singleChannelBar = new QHBoxLayout;
+    m_fftChannelSelector = new QComboBox(singleChannelPage);
+    m_fftChannelSelector->addItems({QStringLiteral("通道 0"), QStringLiteral("通道 1"),
+                                    QStringLiteral("通道 2"), QStringLiteral("通道 3")});
+    m_fftStatus = new QLabel(QStringLiteral("等待板端 SCOPE 帧与 PS FFT"), singleChannelPage);
+    singleChannelBar->addWidget(new QLabel(QStringLiteral("FFT 通道"), singleChannelPage));
+    singleChannelBar->addWidget(m_fftChannelSelector);
+    singleChannelBar->addWidget(m_fftStatus, 1);
+    singleChannelLayout->addLayout(singleChannelBar);
+    auto *singleChannelSplitter = new QSplitter(Qt::Vertical, singleChannelPage);
+    m_singleChannelScope = new ScopeWidget(singleChannelSplitter);
+    for (int channel = 0; channel < pdsample::kChannelCount; ++channel)
+        m_singleChannelScope->setChannelVisible(channel, channel == 0);
+    m_spectrumPlot = new PlotWidget(singleChannelSplitter);
+    singleChannelSplitter->addWidget(m_singleChannelScope);
+    singleChannelSplitter->addWidget(m_spectrumPlot);
+    singleChannelSplitter->setStretchFactor(0, 1);
+    singleChannelSplitter->setStretchFactor(1, 1);
+    singleChannelSplitter->setSizes({420, 360});
+    singleChannelLayout->addWidget(singleChannelSplitter, 1);
+    tabs->addTab(singleChannelPage, QStringLiteral("单通道波形 + PS FFT"));
+    connect(m_fftChannelSelector, qOverload<int>(&QComboBox::currentIndexChanged),
+            this, [this](int channel) {
+        if (m_singleChannelScope == nullptr) return;
+        for (int c = 0; c < pdsample::kChannelCount; ++c)
+            m_singleChannelScope->setChannelVisible(c, c == channel);
+        if (m_hasLastScopeFrame) {
+            m_singleChannelScope->setLiveFrame(m_lastScopeFrame,
+                                                m_stream->lastTriggerIndex(),
+                                                m_stream->lastTriggerValid(),
+                                                m_triggerLevel->value(),
+                                                m_triggerChannel->currentIndex());
+            m_singleChannelScope->setPulses(m_livePulses);
+            (void)refreshSpectrumFor(m_lastScopeFrame);
+        }
+    });
 
     /* ===== 页签 4：PRPD 相位直方图 ===== */
     auto *histPage = new QWidget(tabs);
@@ -675,7 +706,7 @@ MainWindow::MainWindow()
 
     /* ---------------------------------------------------------- 分析工作线程 */
     /*
-     * 把"解码 / 统计 / FFT / 脉冲检测 / 大文件 IO"搬出 GUI 线程。
+     * 把"解码 / 统计 / 脉冲检测 / 大文件 IO"搬出 GUI 线程；实时 FFT 由 PS 处理。
      * 2026-09-23 上板实测的卡死就发生在这些地方：3.12 MB 快照要在事件循环里
      * 解出 200 万个 double 再遍历统计，界面在那几百毫秒里完全无响应。
      */
@@ -711,6 +742,17 @@ MainWindow::MainWindow()
         if (m_prpdLiveEnabled->isChecked()) startPrpdRound();
     });
 
+    m_prpdDisplayTimer = new QTimer(this);
+    m_prpdDisplayTimer->setSingleShot(true);
+    m_prpdDisplayTimer->setInterval(50);
+    connect(m_prpdDisplayTimer, &QTimer::timeout, this, &MainWindow::flushPrpdDisplay);
+
+    m_scopeFftTimeout = new QTimer(this);
+    m_scopeFftTimeout->setSingleShot(true);
+    connect(m_scopeFftTimeout, &QTimer::timeout, this, [this] {
+        finishPsSpectrumRequest(QStringLiteral("等待 PS FFT 二进制结果超时。"));
+    });
+
     m_snapshotTimer = new QTimer(this);
     m_snapshotTimer->setInterval(300);
     connect(m_snapshotTimer, &QTimer::timeout, this, &MainWindow::pumpSnapshotGrab);
@@ -730,6 +772,9 @@ MainWindow::MainWindow()
         }
     });
     connect(&m_client, &PdTcpClient::disconnected, this, [this] {
+        if (m_scopeFftInFlight)
+            finishPsSpectrumRequest(QStringLiteral("TCP 断开，PS FFT 请求取消。"));
+        if (m_prpdRound != PrpdRound::Idle) finishPrpdRound();
         m_prpdRoundTimer->stop();
         m_snapshotTimer->stop();
         m_snapshotStage = SnapshotStage::Idle;
@@ -737,7 +782,45 @@ MainWindow::MainWindow()
     });
     connect(&m_client, &PdTcpClient::textLine, this, &MainWindow::handleLine);
     connect(&m_client, &PdTcpClient::transportError, this,
-            [this](const QString &e) { appendLog(QStringLiteral("ERR"), e); });
+            [this](const QString &e) {
+        appendLog(QStringLiteral("ERR"), e);
+        if (m_scopeFftInFlight) finishPsSpectrumRequest(e);
+    });
+    connect(&m_client, &PdTcpClient::scopeSpectrumFrame, this,
+            [this](const QByteArray &magnitudesLe, quint32 sequence, quint32 channel,
+                   quint32 sampleRateHz, quint32 peakBin, quint32 peakHz,
+                   quint32 amplitudeCode, quint32 dcCode) {
+        if (!m_scopeFftInFlight) return;
+        if (sequence != m_scopeFftExpectedSequence || channel != m_scopeFftExpectedChannel ||
+            magnitudesLe.size() != 513 * 2) {
+            finishPsSpectrumRequest(QStringLiteral(
+                "PS FFT 帧不匹配：期望 seq=%1/CH%2，收到 seq=%3/CH%4/bytes=%5。")
+                .arg(m_scopeFftExpectedSequence).arg(m_scopeFftExpectedChannel)
+                .arg(sequence).arg(channel).arg(magnitudesLe.size()));
+            return;
+        }
+        QVector<QPointF> curve;
+        curve.reserve(513);
+        const auto *bytes = reinterpret_cast<const uchar *>(magnitudesLe.constData());
+        for (int bin = 0; bin <= 512; ++bin) {
+            const quint16 amplitude = qFromLittleEndian<quint16>(bytes + bin * 2);
+            const double db = amplitude == 0U ? -120.0
+                                               : 20.0 * std::log10(amplitude);
+            const double hz = static_cast<double>(bin) * sampleRateHz / 1024.0;
+            curve.append(QPointF(hz, db));
+        }
+        QVector<QVector<QPointF>> curves;
+        curves.append(curve);
+        const QString name = QStringLiteral("CH%1 (PS)").arg(channel);
+        m_spectrumPlot->setLines(curves, QStringList{name},
+            QStringLiteral("PS 端 Hann FFT · seq=%1 · bin=%2 · 主峰 %3 Hz · %4 码 · DC %5")
+                .arg(sequence).arg(peakBin).arg(peakHz).arg(amplitudeCode).arg(dcCode),
+            QStringLiteral("频率 Hz"), QStringLiteral("幅值 dB（相对 1 ADC 码）"));
+        m_fftStatus->setText(QStringLiteral("PS FFT：seq=%1，CH%2，1024 点，Δf=%3 Hz")
+                                 .arg(sequence).arg(channel).arg(sampleRateHz / 1024U));
+        Q_UNUSED(peakBin);
+        finishPsSpectrumRequest();
+    });
     connect(&m_client, &PdTcpClient::downloadProgress, this, [this](qint64 now, qint64 all) {
         m_downloadProgress->setValue(all == 0 ? 0 : static_cast<int>(now * 100 / all));
         /* 下载阶段按"有无进展"判超时：每收到一段就刷新计时。 */
@@ -781,7 +864,14 @@ MainWindow::MainWindow()
     });
     connect(&m_client, &PdTcpClient::downloadFailed, this, [this](const QString &why) {
         appendLog(QStringLiteral("ERR"), QStringLiteral("下载失败：%1").arg(why));
-        if (m_eventDownloadInFlight) nextPrpdCandidate();
+        if (m_scopeFftInFlight) finishPsSpectrumRequest(why);
+        if (m_eventDownloadInFlight) {
+            /* Keep the contiguous cursor at this record and retry it next round. */
+            appendLog(QStringLiteral("PRPD"),
+                      QStringLiteral("seq=%1 下载失败，游标不前移；下一轮重试。")
+                          .arg(m_eventDownloadSequence));
+            finishPrpdRound();
+        }
         if (m_snapshotStage != SnapshotStage::Idle) abortSnapshotGrab(why);
     });
 
@@ -808,9 +898,12 @@ MainWindow::MainWindow()
     });
     connect(m_scope, &ScopeWidget::pulsePicked, this, &MainWindow::onPulsePicked);
     connect(m_staticScope, &ScopeWidget::pulsePicked, this, &MainWindow::onPulsePicked);
+    connect(m_singleChannelScope, &ScopeWidget::pulsePicked, this, &MainWindow::onPulsePicked);
 
     connect(m_stream, &ScopeStream::liveFrame, this,
             [this](const pdsample::WaveformFrame &frame, int triggerIndex, bool valid) {
+        m_lastScopeFrame = frame;
+        m_hasLastScopeFrame = true;
         m_scope->setLiveFrame(frame, triggerIndex, valid,
                               m_triggerLevel->value(), m_triggerChannel->currentIndex());
         if (m_triggerAlign->isChecked() && valid && triggerIndex >= 0) {
@@ -833,12 +926,28 @@ MainWindow::MainWindow()
             updatePulseStatistics();
         }
 
+        if (m_singleChannelScope != nullptr) {
+            const int selected = m_fftChannelSelector != nullptr
+                                     ? m_fftChannelSelector->currentIndex() : 0;
+            for (int channel = 0; channel < pdsample::kChannelCount; ++channel)
+                m_singleChannelScope->setChannelVisible(channel, channel == selected);
+            m_singleChannelScope->setLiveFrame(frame, triggerIndex, valid,
+                                               m_triggerLevel->value(),
+                                               m_triggerChannel->currentIndex());
+            m_singleChannelScope->setPulses(m_pulseOverlay->isChecked()
+                                                ? m_livePulses
+                                                : QVector<pddetect::Pulse>());
+        }
+
         ++m_liveFftCounter;
         if ((m_liveFftCounter % 4U) == 1U && frame.sampleCount >= 1024)
-            refreshSpectrumFor(frame);
+            (void)refreshSpectrumFor(frame);
     });
     connect(m_stream, &ScopeStream::eventFrame, this,
-            [this](const pdsample::WaveformFrame &frame, quint32 eventSequence) {
+            [this](const pdsample::WaveformFrame &frame, quint32 eventSequence,
+                   quint32 channel, quint32 eventWordSequence) {
+        m_lastScopeFrame = frame;
+        m_hasLastScopeFrame = true;
         if (m_pulseOverlay->isChecked()) {
             const pddetect::Result pulses = pddetect::detect(frame, m_pulseSettings);
             m_livePulses = pddetect::flatten(pulses);
@@ -846,20 +955,41 @@ MainWindow::MainWindow()
             updatePulseStatistics();
         }
         m_scope->setEventFrame(frame,
-                               QStringLiteral("PL 局放事件 seq=%1（事件中心波形）")
-                                   .arg(eventSequence),
+                               QStringLiteral("PL 事件记录 %1 / CH%2 / evt_seq=%3（候选相位窗口）")
+                                   .arg(eventSequence).arg(channel).arg(eventWordSequence),
                                500);
+        if (m_singleChannelScope != nullptr) {
+            if (m_fftChannelSelector != nullptr &&
+                m_fftChannelSelector->currentIndex() != static_cast<int>(channel)) {
+                const QSignalBlocker blocker(m_fftChannelSelector);
+                m_fftChannelSelector->setCurrentIndex(static_cast<int>(channel));
+            }
+            for (int c = 0; c < pdsample::kChannelCount; ++c)
+                m_singleChannelScope->setChannelVisible(c, c == m_fftChannelSelector->currentIndex());
+            m_singleChannelScope->setEventFrame(frame,
+                QStringLiteral("事件记录 %1 / CH%2 / evt_seq=%3（相位候选窗）")
+                    .arg(eventSequence).arg(channel).arg(eventWordSequence), 500);
+            m_singleChannelScope->setPulses(m_pulseOverlay->isChecked()
+                                                ? m_livePulses
+                                                : QVector<pddetect::Pulse>());
+        }
         appendLog(QStringLiteral("EVENT-WAVE"),
-                  QStringLiteral("已显示 PL 事件 %1 的中心波形（保持 500 ms）。")
+                  QStringLiteral("已按通道与 evt_seq 选择事件记录 %1 的候选波形窗；"
+                                 "快照周期关联尚未证明（保持 500 ms）。")
                       .arg(eventSequence));
-        /* PRPD 归档回合在等待这一个二进制帧；现在安全地取下一条。 */
-        if (m_eventDownloadInFlight) nextPrpdCandidate();
+        /* 若此帧属于归档回合，先让 PS 对同一缓冲帧做 FFT，再推进下一条记录。 */
+        if (m_eventDownloadInFlight) {
+            if (!refreshSpectrumFor(frame, true)) nextPrpdCandidate();
+        } else {
+            (void)refreshSpectrumFor(frame);
+        }
     });
     connect(m_stream, &ScopeStream::eventFrameFailed, this,
-            [this](quint32 eventSequence, const QString &reason) {
+            [this](quint32 eventSequence, quint32 channel, quint32 eventWordSequence,
+                   const QString &reason) {
         appendLog(QStringLiteral("ERR"),
-                  QStringLiteral("事件 %1 中心波形获取失败：%2")
-                      .arg(eventSequence).arg(reason));
+                  QStringLiteral("事件记录 %1 / CH%2 / evt_seq=%3 波形窗获取失败：%4")
+                      .arg(eventSequence).arg(channel).arg(eventWordSequence).arg(reason));
         if (m_eventDownloadInFlight) nextPrpdCandidate();
     });
     connect(m_stream, &ScopeStream::rollFrame, this,
@@ -1026,16 +1156,28 @@ void MainWindow::applyScopeSettings()
     m_scope->setRollCapacity(m_rollCapacity->value());
     m_scope->setTriggerOverlay(m_scopeMode->currentIndex() == 1, trigger.level, trigger.channel);
     m_scope->setAutoScaleY(m_autoScaleY->isChecked());
+    if (m_singleChannelScope != nullptr) {
+        m_singleChannelScope->setTriggerOverlay(m_scopeMode->currentIndex() == 1,
+                                                trigger.level, trigger.channel);
+        m_singleChannelScope->setAutoScaleY(m_autoScaleY->isChecked());
+    }
     for (int c = 0; c < pdsample::kChannelCount; ++c) {
         m_scope->setChannelVisible(c, m_channelVisible[c]->isChecked());
         m_scope->setChannelGain(c, m_channelGain[c]->value());
         m_scope->setChannelOffset(c, m_channelOffset[c]->value());
+        if (m_singleChannelScope != nullptr) {
+            m_singleChannelScope->setChannelVisible(
+                c, c == m_fftChannelSelector->currentIndex());
+            m_singleChannelScope->setChannelGain(c, m_channelGain[c]->value());
+            m_singleChannelScope->setChannelOffset(c, m_channelOffset[c]->value());
+        }
     }
 }
 
 void MainWindow::applyRingSettings()
 {
     for (auto *panel : m_prpdPanels) panel->setAgingSeconds(m_ringAging->value());
+    for (auto *panel : m_ellipses) panel->setAgingSeconds(m_ringAging->value());
 }
 
 void MainWindow::toggleScope()
@@ -1160,6 +1302,7 @@ void MainWindow::startPrpdRound()
 {
     if (m_prpdRound != PrpdRound::Idle) return;
     if (!m_client.isConnected()) return;
+    if (m_scopeFftInFlight) return;
     if (m_snapshotStage != SnapshotStage::Idle) return; /* 暂停编排期间不抢链路 */
     /* 归档冻结退避：没有新事件时继续按间隔发 CATALOG 只是白刷链路与日志。 */
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
@@ -1170,6 +1313,7 @@ void MainWindow::startPrpdRound()
     m_prpdRoundProbed = 0;
     m_prpdRoundFetched = 0;
     m_prpdAddedPoints = 0;
+    m_prpdEventWaveRequested = false;
     /* 取帧中就先让出链路；等在途的 SCOPE 帧收完再发命令。 */
     if (m_stream->isRunning()) m_stream->setSuspendRequests(true);
     m_ringStatus = QStringLiteral("读取事件归档…");
@@ -1203,14 +1347,11 @@ void MainWindow::pumpPrpdRound()
         m_client.sendCommand(QStringLiteral("CATALOG"));
         return;
     }
-    /* 每回合只求"一条含峰值的记录"：单条记录就有上千个峰值字，
-       再往下试只是把注定失败的往返堆上去。 */
-    if (m_prpdRoundFetched == 0 && m_prpdRoundProbed < kEventProbeLimit &&
-        !m_prpdEventQueue.isEmpty()) {
+    /* 按本轮预先排好的旧→新顺序排空；失败记录保留游标，下轮重试。 */
+    if (!m_prpdEventQueue.isEmpty()) {
         fetchNextPrpdEvent();
         return;
     }
-    m_prpdEventQueue.clear();
     finishPrpdRound();
 }
 
@@ -1219,12 +1360,19 @@ void MainWindow::finishPrpdRound()
     const bool wasActive = (m_prpdRound != PrpdRound::Idle);
     m_prpdRound = PrpdRound::Idle;
     m_catalogRequestPending = false;
+    m_eventDownloadInFlight = false;
+    m_eventDownloadSequence = 0xFFFFFFFFU;
     m_prpdEventQueue.clear();
     if (m_stream->isSuspended()) m_stream->setSuspendRequests(false);
     if (wasActive && (m_prpdRoundProbed > 0 || m_prpdRoundFetched > 0))
         appendLog(QStringLiteral("PRPD"),
-                  QStringLiteral("回合：探测 %1 条，取到 %2 条含峰值记录，新增 %3 点，耗时 %4 ms")
+                  QStringLiteral("回合：处理 %1 条，成功记录 %2 条，新增 %3 点，"
+                                 "游标 %4/%5，待处理 %6，已覆盖缺口 %7，耗时 %8 ms")
                       .arg(m_prpdRoundProbed).arg(m_prpdRoundFetched).arg(m_prpdAddedPoints)
+                      .arg(m_nextPrpdSequence).arg(m_latestPrpdSequence)
+                      .arg(m_latestPrpdSequence >= m_nextPrpdSequence
+                               ? m_latestPrpdSequence - m_nextPrpdSequence : 0U)
+                      .arg(m_prpdSequenceGaps)
                       .arg(QDateTime::currentMSecsSinceEpoch() - m_prpdRoundStartMs));
 }
 
@@ -1238,7 +1386,6 @@ void MainWindow::nextPrpdCandidate()
 void MainWindow::fetchNextPrpdEvent()
 {
     if (m_eventDownloadInFlight || m_prpdEventQueue.isEmpty()) return;
-    if (m_prpdRoundProbed >= kEventProbeLimit || m_prpdRoundFetched > 0) return;
     m_eventDownloadInFlight = true;
     ++m_prpdRoundProbed;
     m_eventDownloadSequence = m_prpdEventQueue.dequeue();
@@ -1255,6 +1402,14 @@ void MainWindow::grabSnapshot()
         return;
     }
     if (m_snapshotStage != SnapshotStage::Idle) return;
+    if (m_scopeFftInFlight) {
+        appendLog(QStringLiteral("ERR"), QStringLiteral("正在接收 PS FFT 结果，请稍后再抓取快照。"));
+        return;
+    }
+    if (m_eventDownloadInFlight) {
+        appendLog(QStringLiteral("ERR"), QStringLiteral("正在下载事件记录；为避免与二进制传输冲突，请稍后再抓快照。"));
+        return;
+    }
 
     /* 先让出链路并停止取帧，再让板端回到 IDLE。
        板端源码明确：GET SNAP 多段下载要求 IDLE（只有 GET EVENT 允许 RUNNING）。 */
@@ -1349,6 +1504,10 @@ void MainWindow::resumeAfterSnapshot()
 
 void MainWindow::handleLine(const QString &line)
 {
+    if (m_scopeFftInFlight && line.startsWith(QStringLiteral("ERR SCOPE FFT"))) {
+        finishPsSpectrumRequest(line);
+        return;
+    }
     /* SCOPE 帧头每帧一条，进日志会把有用信息刷掉；只更新状态栏。 */
     if (line.startsWith(QStringLiteral("SCOPE V1 "))) {
         statusBar()->showMessage(QStringLiteral("实时取帧：%1").arg(line));
@@ -1360,6 +1519,32 @@ void MainWindow::handleLine(const QString &line)
         statusBar()->showMessage(QStringLiteral("快照分段下载中：%1").arg(line));
     } else {
         appendLog(QStringLiteral("<<"), line);
+    }
+
+    if (line.startsWith(QStringLiteral("CONFIG "))) {
+        const pdreply::Config config = pdreply::parseConfig(line);
+        if (config.ok && config.hasScaleQ88) {
+            const bool commonScale = config.scaleQ88[0] == config.scaleQ88[1] &&
+                                     config.scaleQ88[0] == config.scaleQ88[2] &&
+                                     config.scaleQ88[0] == config.scaleQ88[3];
+            if (commonScale && m_scaleQ88 != nullptr) {
+                const QSignalBlocker blocker(m_scaleQ88);
+                m_scaleQ88->setValue(config.scaleQ88[0]);
+                applyPulseSettings();
+                appendLog(QStringLiteral("CFG"),
+                          QStringLiteral("从板端 CONFIG 同步 SCALE(Q8.8)=%1。")
+                              .arg(config.scaleQ88[0]));
+            } else {
+                appendLog(QStringLiteral("ERR"),
+                          QStringLiteral("板端各通道 SCALE 不一致：%1/%2/%3/%4；"
+                                         "当前上位机使用单一公共 SCALE，未自动套用。")
+                              .arg(config.scaleQ88[0]).arg(config.scaleQ88[1])
+                              .arg(config.scaleQ88[2]).arg(config.scaleQ88[3]));
+            }
+        } else if (config.ok) {
+            appendLog(QStringLiteral("WARN"),
+                      QStringLiteral("板端 CONFIG 未提供有效 scale_q88，沿用手动/默认值。"));
+        }
     }
 
     /* ---- 抓快照编排：等 IDLE ---- */
@@ -1420,49 +1605,77 @@ void MainWindow::handleLine(const QString &line)
         m_catalogRequestPending = false;
         if (m_prpdRound != PrpdRound::Idle) m_prpdRound = PrpdRound::FetchingEvents;
 
-        /* 归档冻结检测：连续两次窗口一模一样，说明没有新事件产生
-           （采集已停，或事件流本身没有推进）。此前会在这种情况下按间隔
-           一直空发 CATALOG，把日志刷满却拿不到任何新数据。 */
-        if (first == m_lastEventFirst && next == m_lastEventNext) {
+        m_latestPrpdSequence = next;
+
+        /* Board restart/CLEAR starts sequence numbering over. Do not mix epochs. */
+        const bool sequenceReset = m_prpdCursorInitialized &&
+            (next < m_nextPrpdSequence ||
+             (first < m_lastEventFirst && next <= m_lastEventNext));
+        if (sequenceReset) {
+            appendLog(QStringLiteral("PRPD"),
+                      QStringLiteral("检测到板端事件序号重置；清空旧点并从 seq=%1 重新同步。")
+                          .arg(first));
+            for (int channel = 0; channel < pdsample::kChannelCount; ++channel) {
+                m_pendingEllipseEvents[channel].clear();
+                m_pendingPrpdPoints[channel].clear();
+            }
+            for (auto *panel : m_prpdPanels) panel->clear();
+            for (auto *panel : m_ellipses) panel->clear();
+            m_prpdAddedPoints = 0;
+            m_prpdSequenceGaps = 0U;
+            m_nextPrpdSequence = first;
+        } else if (!m_prpdCursorInitialized) {
+            /* First connection: consume the oldest record still retained by PS. */
+            m_nextPrpdSequence = first;
+            m_prpdCursorInitialized = true;
+        } else if (m_nextPrpdSequence < first) {
+            const quint32 lost = first - m_nextPrpdSequence;
+            m_prpdSequenceGaps += lost;
+            appendLog(QStringLiteral("GAP"),
+                      QStringLiteral("PS 事件环覆盖了 %1 条尚未读取记录；从 seq=%2 继续。")
+                          .arg(lost).arg(first));
+            m_nextPrpdSequence = first;
+        } else if (m_nextPrpdSequence > next) {
+            /* Defensive recovery for an inconsistent/reset catalogue. */
+            m_nextPrpdSequence = first;
+        }
+
+        /*
+         * A stable catalog is only frozen when its retained range is already
+         * consumed. An unchanged catalog with backlog must keep draining.
+         */
+        const bool sameWindow = first == m_lastEventFirst && next == m_lastEventNext;
+        const bool hasBacklog = m_prpdCursorInitialized && m_nextPrpdSequence < next;
+        if (sameWindow && !hasBacklog) {
             ++m_frozenWindowCount;
             if (m_frozenWindowCount >= 2) {
                 m_prpdBackoffUntilMs = QDateTime::currentMSecsSinceEpoch() + kFrozenBackoffMs;
-                m_ringStatus = QStringLiteral("事件归档已冻结（无新事件）");
+                m_ringStatus = QStringLiteral("事件归档已冻结（无未处理记录）");
                 for (auto *panel : m_prpdPanels) panel->setStatusText(m_ringStatus);
-                m_ringStats->setText(
-                    QStringLiteral("相位环：归档冻结，%1 s 后重试（点“立即刷新一次”可强制）")
-                        .arg(kFrozenBackoffMs / 1000));
             }
         } else {
             m_frozenWindowCount = 0;
             m_prpdBackoffUntilMs = 0;
-            m_lastEventFirst = first;
-            m_lastEventNext = next;
         }
+        m_lastEventFirst = first;
+        m_lastEventNext = next;
 
-        if (next > first && m_frozenWindowCount < 2) {
-            /* 板端序号重置后需要整体重载（例如重新上电或 CLEAR）。 */
-            if (!m_loadedPrpdSequences.isEmpty() &&
-                next <= *std::max_element(m_loadedPrpdSequences.begin(),
-                                          m_loadedPrpdSequences.end())) {
-                m_loadedPrpdSequences.clear();
-                for (auto *panel : m_prpdPanels) panel->clear();
-            }
-            /*
-             * 候选按"最新优先"排队。实测归档寿命只有几十毫秒
-             * （两回合之间 event_seq 前进约 101 条，归档仅 16 槽），
-             * 所以先试最新的；一遇失败或取到一条就收手，
-             * 不做注定失效的补试——那只是白占链路往返。
-             */
-            int queued = 0;
-            for (quint32 upper = next; upper > first && queued < kEventProbeLimit; --upper) {
-                const quint32 sequence = upper - 1U;
-                if (m_loadedPrpdSequences.contains(sequence) ||
-                    m_prpdEventQueue.contains(sequence))
-                    continue;
+        m_prpdEventQueue.clear();
+        if (hasBacklog && m_frozenWindowCount < 2) {
+            const quint32 queuedCount = qMin(
+                next - m_nextPrpdSequence,
+                static_cast<quint32>(kEventRecordsPerRound));
+            const quint32 queueEnd = m_nextPrpdSequence + queuedCount;
+            for (quint32 sequence = m_nextPrpdSequence; sequence < queueEnd; ++sequence)
                 m_prpdEventQueue.enqueue(sequence);
-                ++queued;
-            }
+        }
+        if (m_ringStats != nullptr) {
+            const quint32 backlog = next >= m_nextPrpdSequence
+                                        ? next - m_nextPrpdSequence : 0U;
+            m_ringStats->setText(
+                QStringLiteral("事件游标 %1/%2｜待处理 %3｜已覆盖缺口 %4｜本轮最多 %5 条")
+                    .arg(m_nextPrpdSequence).arg(next).arg(backlog)
+                    .arg(m_prpdSequenceGaps).arg(kEventRecordsPerRound));
         }
         pumpPrpdRound();
         return;
@@ -1473,14 +1686,22 @@ void MainWindow::handleLine(const QString &line)
     if (event.ok && event.sequence == m_eventDownloadSequence) {
         const quint32 bytes = event.bytes;
         const quint32 peaks = event.peaks;
-        /* 元数据已确认这个序号有效，记下来就不会重复探测它。 */
-        m_loadedPrpdSequences.insert(m_eventDownloadSequence);
         /*
          * peaks=0 的记录里只有一个周期统计字，没有任何峰值事件。
          * 板端日志里这类记录占了相当比例（bytes=8 peaks=0 cycles=1），
          * 直接跳过就省掉一次毫无收益的二进制下载。
          */
         if (peaks == 0U || bytes <= 8U) {
+            ++m_prpdRoundFetched;
+            if (m_eventDownloadSequence == m_nextPrpdSequence)
+                ++m_nextPrpdSequence;
+            else {
+                appendLog(QStringLiteral("ERR"),
+                          QStringLiteral("PRPD 序号游标不连续：期望 %1，收到空记录 %2。")
+                              .arg(m_nextPrpdSequence).arg(m_eventDownloadSequence));
+                finishPrpdRound();
+                return;
+            }
             nextPrpdCandidate();
             return;
         }
@@ -1494,7 +1715,14 @@ void MainWindow::handleLine(const QString &line)
     if (m_eventDownloadInFlight &&
         (line.startsWith(QStringLiteral("ERR EVENT")) ||
          line.startsWith(QStringLiteral("ERR GET EVENT")))) {
-        /* 序号已被环形覆盖：换下一条候选。不清空已有画面——覆盖是预期行为。 */
+        /* Catalog 中存在但读取时已被覆盖：记一个明确缺口后继续顺序排空。 */
+        if (m_eventDownloadSequence == m_nextPrpdSequence) {
+            ++m_nextPrpdSequence;
+            ++m_prpdSequenceGaps;
+        }
+        appendLog(QStringLiteral("GAP"),
+                  QStringLiteral("EVENT seq=%1 在读取前已不可用；累计缺口 %2。")
+                      .arg(m_eventDownloadSequence).arg(m_prpdSequenceGaps));
         nextPrpdCandidate();
         return;
     }
@@ -1585,7 +1813,8 @@ void MainWindow::loadSnapshotPlots(const QString &path)
 {
     /*
      * 全流程交给工作线程：读 3.12 MB 文件 → decodeFrame 解 200 万个 double →
-     * measure 再遍历 200 万点 → 脉冲检测 → 4 次 FFT。
+     * measure 再遍历 200 万点 → 脉冲检测。FFT 不在 Qt 处理这份静态快照；
+     * 实时短帧 FFT 由板端 PS 提供并在 Qt 绘图。
      * 之前这些都在 GUI 线程里连着做，一次阻塞数百毫秒，是"暂停抓取之后卡死"的主因。
      */
     appendLog(QStringLiteral(">>"), QStringLiteral("归档快照解码已提交工作线程：%1").arg(path));
@@ -1593,17 +1822,61 @@ void MainWindow::loadSnapshotPlots(const QString &path)
                               Q_ARG(QString, path), Q_ARG(double, kDefaultSampleRateHz),
                               Q_ARG(qint64, static_cast<qint64>(m_snapshotTarget)),
                               Q_ARG(QString, QStringLiteral("归档快照（时间连续）")),
-                              Q_ARG(bool, true));
+                              Q_ARG(bool, false));
 }
 
 
-void MainWindow::refreshSpectrumFor(const pdsample::WaveformFrame &frame)
+bool MainWindow::refreshSpectrumFor(const pdsample::WaveformFrame &frame,
+                                    bool completesPrpdEvent)
 {
-    /* FFT 也搬去工作线程：4 通道 radix-2 FFT 虽只需微秒级，但没必要占着 GUI 线程。 */
-    if (m_worker == nullptr) return;
-    WaveformFramePtr ptr(new pdsample::WaveformFrame(frame));
-    QMetaObject::invokeMethod(m_worker, "computeSpectrum", Qt::QueuedConnection,
-                              Q_ARG(WaveformFramePtr, ptr));
+    if (!m_client.isConnected() || m_stream == nullptr || m_scopeFftInFlight ||
+        frame.sampleCount != 1024 || frame.sequence < 0 ||
+        m_fftChannelSelector == nullptr || m_spectrumPlot == nullptr)
+        return false;
+    if (m_stream->state() != ScopeStream::State::Streaming) return false;
+    if (m_stream->isFrameInFlight()) return false;
+    if (completesPrpdEvent) {
+        if (!m_eventDownloadInFlight) return false;
+    } else if (m_prpdRound != PrpdRound::Idle ||
+               m_snapshotStage != SnapshotStage::Idle || m_eventDownloadInFlight) {
+        return false;
+    }
+
+    m_scopeFftExpectedSequence = static_cast<quint32>(frame.sequence);
+    m_scopeFftExpectedChannel = static_cast<quint32>(m_fftChannelSelector->currentIndex());
+    m_scopeFftOwnsSuspend = !m_stream->isSuspended();
+    m_scopeFftCompletesPrpdEvent = completesPrpdEvent;
+    m_scopeFftInFlight = true;
+    if (m_scopeFftOwnsSuspend) m_stream->setSuspendRequests(true);
+    if (m_fftStatus != nullptr)
+        m_fftStatus->setText(QStringLiteral("请求 PS FFT：seq=%1，CH%2…")
+                                 .arg(m_scopeFftExpectedSequence)
+                                 .arg(m_scopeFftExpectedChannel));
+    m_scopeFftTimeout->start(3000);
+    m_client.sendCommand(QStringLiteral("SCOPE FFT CHANNEL %1")
+                             .arg(m_scopeFftExpectedChannel));
+    return true;
+}
+
+void MainWindow::finishPsSpectrumRequest(const QString &error)
+{
+    if (!m_scopeFftInFlight) return;
+    m_scopeFftTimeout->stop();
+    const bool advancePrpd = m_scopeFftCompletesPrpdEvent && m_eventDownloadInFlight;
+    const bool resumeStream = m_scopeFftOwnsSuspend;
+    m_scopeFftInFlight = false;
+    m_scopeFftOwnsSuspend = false;
+    m_scopeFftCompletesPrpdEvent = false;
+
+    if (!error.isEmpty()) {
+        if (m_fftStatus != nullptr)
+            m_fftStatus->setText(QStringLiteral("PS FFT 失败：%1").arg(error));
+        appendLog(QStringLiteral("ERR"), QStringLiteral("PS FFT：%1").arg(error));
+    }
+    if (advancePrpd) nextPrpdCandidate();
+    else if (resumeStream && m_stream != nullptr && m_stream->isRunning() &&
+             m_prpdRound == PrpdRound::Idle && m_snapshotStage == SnapshotStage::Idle)
+        m_stream->setSuspendRequests(false);
 }
 
 void MainWindow::loadEventPrpd(const QString &path)
@@ -1676,10 +1949,25 @@ void MainWindow::onEventBatchDecoded(QVector<pdsample::PeakEvent> events, quint3
 {
     if (!error.isEmpty()) {
         appendLog(QStringLiteral("ERR"), error);
-        /* 解码失败也要把回合推进，否则链路被这一条卡死。 */
-        if (m_eventDownloadInFlight) nextPrpdCandidate();
+        /* Corrupt/unsupported data is not silently skipped: retry from this sequence. */
+        if (m_eventDownloadInFlight && sequence == m_eventDownloadSequence) {
+            appendLog(QStringLiteral("PRPD"),
+                      QStringLiteral("seq=%1 解码失败，游标不前移；下一轮重试。")
+                          .arg(sequence));
+            finishPrpdRound();
+        }
         return;
     }
+    if (!m_eventDownloadInFlight || sequence != m_eventDownloadSequence ||
+        sequence != m_nextPrpdSequence) {
+        appendLog(QStringLiteral("ERR"),
+                  QStringLiteral("PRPD 解码序号不匹配：游标 %1、在途 %2、回调 %3。")
+                      .arg(m_nextPrpdSequence).arg(m_eventDownloadSequence).arg(sequence));
+        if (m_eventDownloadInFlight) finishPrpdRound();
+        return;
+    }
+    ++m_nextPrpdSequence;
+    ++m_prpdRoundFetched;
     if (unrecognised > 0) {
         m_unrecognisedEvents += static_cast<quint64>(unrecognised);
         appendLog(QStringLiteral("ERR"),
@@ -1699,8 +1987,14 @@ void MainWindow::onEventBatchDecoded(QVector<pdsample::PeakEvent> events, quint3
     QVector<pdsample::PeakEvent> qualifiedEvents;
     qualifiedEvents.reserve(events.size());
     for (const pdsample::PeakEvent &event : events) {
-        if (passesHostEventThreshold(event))
-            qualifiedEvents.append(event);
+        pdsample::PeakEvent calibratedEvent = event;
+        const double scaleQ88 = m_scaleQ88 != nullptr
+                                    ? m_scaleQ88->value()
+                                    : pdsample::eventpacket::kDefaultScaleQ88;
+        calibratedEvent.adcCodes = pdsample::eventpacket::adcCodesFromField(
+            event.qRaw, scaleQ88);
+        if (passesHostEventThreshold(calibratedEvent))
+            qualifiedEvents.append(calibratedEvent);
         else
             ++m_hostEventRejected;
     }
@@ -1716,24 +2010,16 @@ void MainWindow::onEventBatchDecoded(QVector<pdsample::PeakEvent> events, quint3
     int drawn = 0;
     QString perChannelText;
     for (int c = 0; c < pdsample::kChannelCount; ++c) {
-        QVector<pdsample::PeakEvent> batch = perChannel.at(c);
+        const QVector<pdsample::PeakEvent> &batch = perChannel.at(c);
         received += batch.size();
-        if (batch.size() > kMaxPointsPerBatchPerChannel) {
-            const int stride =
-                (batch.size() + kMaxPointsPerBatchPerChannel - 1) / kMaxPointsPerBatchPerChannel;
-            QVector<pdsample::PeakEvent> thinned;
-            thinned.reserve(batch.size() / stride + 1);
-            for (int i = 0; i < batch.size(); i += stride) thinned.append(batch.at(i));
-            batch = thinned;
-        }
-        if (c < m_ellipses.size()) m_ellipses[c]->appendEvents(batch);
+        m_pendingEllipseEvents[c] += batch;
 
         /* 散点图与椭圆图用同一批点：前者是直角坐标，后者是相位刻度盘。 */
         QVector<QPointF> scatter;
         scatter.reserve(batch.size());
         for (const pdsample::PeakEvent &event : batch)
             scatter.append(QPointF(event.phaseDeg, event.q88));
-        if (c < m_prpdPanels.size()) m_prpdPanels[c]->appendPoints(scatter);
+        m_pendingPrpdPoints[c] += scatter;
 
         drawn += batch.size();
         perChannelText += QStringLiteral("%1%2")
@@ -1741,36 +2027,65 @@ void MainWindow::onEventBatchDecoded(QVector<pdsample::PeakEvent> events, quint3
                               .arg(batch.size());
     }
     m_prpdAddedPoints += drawn;
+    if (drawn > 0 && m_prpdDisplayTimer != nullptr && !m_prpdDisplayTimer->isActive())
+        m_prpdDisplayTimer->start();
 
     m_ringStatus = QStringLiteral("seq=%1 ｜ 接收 %2 绘制 %3 ｜ 各通道 %4")
                        .arg(sequence).arg(received).arg(drawn).arg(perChannelText);
     for (auto *panel : m_prpdPanels) panel->setStatusText(m_ringStatus);
     for (auto *panel : m_ellipses) panel->setStatusText(m_ringStatus);
 
-    if (m_ringStats != nullptr) {
-        QString ellipses;
-        for (int c = 0; c < m_ellipses.size(); ++c)
-            ellipses += QStringLiteral("%1%2")
-                            .arg(c == 0 ? QString() : QStringLiteral("/"))
-                            .arg(m_ellipses.at(c)->eventCount());
-        m_ringStats->setText(
-            QStringLiteral("相位环/椭圆：累计 %1 点（只保留最近 %2 s）｜椭圆 %3")
-                .arg(m_prpdAddedPoints)
-                .arg(m_ringAging->value())
-                .arg(ellipses));
-    }
     updatePulseStatistics();
 
     /* 解码完成。先请求同一 PL 事件对应的中心波形；二进制帧结束后，
        eventFrame 信号会再推进回合，避免与 EVENT 下载抢同一条 TCP 链路。 */
     if (m_eventDownloadInFlight) {
-        ++m_prpdRoundFetched;
-        const bool requestEventWave = !qualifiedEvents.isEmpty() &&
+        /* Only one event waveform probe per archive batch; prioritize draining records. */
+        const bool requestEventWave = !m_prpdEventWaveRequested && !qualifiedEvents.isEmpty() &&
                                       m_stream->state() == ScopeStream::State::Streaming;
-        if (requestEventWave)
-            m_stream->requestEventFrame(sequence);
-        else
+        if (requestEventWave) {
+            const pdsample::PeakEvent &selected = qualifiedEvents.constFirst();
+            m_prpdEventWaveRequested = true;
+            m_stream->requestEventFrame(sequence, static_cast<quint32>(selected.channel),
+                                         selected.evtSeq);
+        } else {
             nextPrpdCandidate();
+        }
+    }
+}
+
+void MainWindow::flushPrpdDisplay()
+{
+    int flushed = 0;
+    for (int channel = 0; channel < pdsample::kChannelCount; ++channel) {
+        if (!m_pendingEllipseEvents[channel].isEmpty() && channel < m_ellipses.size()) {
+            flushed += m_pendingEllipseEvents[channel].size();
+            m_ellipses[channel]->appendEvents(m_pendingEllipseEvents[channel]);
+            m_pendingEllipseEvents[channel].clear();
+        }
+        if (!m_pendingPrpdPoints[channel].isEmpty() && channel < m_prpdPanels.size()) {
+            m_prpdPanels[channel]->appendPoints(m_pendingPrpdPoints[channel]);
+            m_pendingPrpdPoints[channel].clear();
+        }
+        if (channel < m_ellipses.size()) m_ellipses[channel]->setStatusText(m_ringStatus);
+        if (channel < m_prpdPanels.size()) m_prpdPanels[channel]->setStatusText(m_ringStatus);
+    }
+
+    if (flushed > 0 && m_ringStats != nullptr) {
+        QString ellipses;
+        for (int channel = 0; channel < m_ellipses.size(); ++channel)
+            ellipses += QStringLiteral("%1%2")
+                            .arg(channel == 0 ? QString() : QStringLiteral("/"))
+                            .arg(m_ellipses.at(channel)->eventCount());
+        m_ringStats->setText(
+            QStringLiteral("相位环/椭圆：累计 %1 点（最近 %2 s，到达时间）｜椭圆 %3｜"
+                           "事件游标 %4/%5，待处理 %6，已覆盖缺口 %7")
+                .arg(m_prpdAddedPoints).arg(m_ringAging->value()).arg(ellipses)
+                .arg(m_nextPrpdSequence).arg(m_latestPrpdSequence)
+                .arg(m_latestPrpdSequence >= m_nextPrpdSequence
+                         ? m_latestPrpdSequence - m_nextPrpdSequence : 0U)
+                .arg(m_prpdSequenceGaps));
+        updatePulseStatistics();
     }
 }
 
@@ -1898,7 +2213,7 @@ void MainWindow::applyPulseSettings()
         panel->setBandLabel(band);
     }
 
-    for (ScopeWidget *widget : {m_scope, m_staticScope}) {
+    for (ScopeWidget *widget : {m_scope, m_staticScope, m_singleChannelScope}) {
         widget->setPulseOverlayVisible(m_pulseOverlay->isChecked());
         widget->setPulseHighlightCodes(highlightCodes);
         widget->setMaximumPulsesDrawn(m_pulseMaxDrawn->value());
@@ -1907,9 +2222,11 @@ void MainWindow::applyPulseSettings()
     if (!m_pulseOverlay->isChecked()) {
         m_scope->setPulses(QVector<pddetect::Pulse>());
         m_staticScope->setPulses(QVector<pddetect::Pulse>());
+        m_singleChannelScope->setPulses(QVector<pddetect::Pulse>());
     } else {
         m_scope->setPulses(m_livePulses);
         m_staticScope->setPulses(m_staticPulses);
+        m_singleChannelScope->setPulses(m_livePulses);
     }
     updatePulseStatistics();
 }
@@ -1919,7 +2236,7 @@ bool MainWindow::passesHostEventThreshold(const pdsample::PeakEvent &event) cons
     if (m_pulseThreshold == nullptr || m_pulseThreshold->value() <= 0.0)
         return true;
 
-    /* PeakEvent::adcCodes 是事件字段按默认 Q8.8=256 换算后的 ADC 码域值。 */
+    /* onEventBatchDecoded() 已按界面中与板端一致的 SCALE 把字段换回 ADC 码。 */
     return std::fabs(event.adcCodes) >= m_pulseThreshold->value();
 }
 

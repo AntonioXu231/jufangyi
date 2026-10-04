@@ -52,6 +52,10 @@ void PdTcpClient::sendCommand(const QString &command)
 void PdTcpClient::downloadRecord(const QString &kind, quint32 index, quint32 offset,
                                  quint32 bytes, const QString &destination)
 {
+    if (!isConnected() || m_mode != ReceiveMode::Text) {
+        emit downloadFailed(QStringLiteral("当前连接没有空闲文本通道，不能开始记录下载。"));
+        return;
+    }
     if (kind != QStringLiteral("SNAP") && kind != QStringLiteral("EVENT")) {
         emit downloadFailed(QStringLiteral("下载类型只能是 SNAP 或 EVENT。"));
         return;
@@ -75,12 +79,34 @@ void PdTcpClient::downloadRecord(const QString &kind, quint32 index, quint32 off
 void PdTcpClient::downloadRecordBySequence(const QString &kind, quint32 sequence, quint32 offset,
                                            quint32 bytes, const QString &destination)
 {
+    if (!isConnected() || m_mode != ReceiveMode::Text) {
+        emit downloadFailed(QStringLiteral("当前连接没有空闲文本通道，不能开始序号下载。"));
+        return;
+    }
     if (kind != QStringLiteral("SNAP") && kind != QStringLiteral("EVENT")) {
         emit downloadFailed(QStringLiteral("下载类型只能是 SNAP 或 EVENT。"));
         return;
     }
-    if (bytes == 0U || bytes > 16384U || destination.isEmpty()) {
-        emit downloadFailed(QStringLiteral("序号下载要求有效的保存路径和 1..16384 字节长度。"));
+    if (bytes == 0U || destination.isEmpty() ||
+        (bytes > 16384U && (kind != QStringLiteral("EVENT") || offset != 0U ||
+                            bytes > 65536U))) {
+        emit downloadFailed(QStringLiteral("序号下载长度或保存路径无效。"));
+        return;
+    }
+    if (kind == QStringLiteral("EVENT") && offset == 0U && bytes > 16384U) {
+        m_wholeEventRecord = true;
+        m_wholeEventSequence = sequence;
+        m_wholeEventBytes = bytes;
+        m_wholeEventOffset = 0U;
+        m_destination = destination;
+        QFile output(m_destination);
+        if (!output.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            emit downloadFailed(QStringLiteral("无法创建文件：%1").arg(m_destination));
+            resetDownload();
+            return;
+        }
+        output.close();
+        beginNextEventChunk();
         return;
     }
     m_destination = destination;
@@ -201,20 +227,35 @@ void PdTcpClient::processTextLines()
         }
         if (line.startsWith(QStringLiteral("SCOPE V1 ")) ||
             line.startsWith(QStringLiteral("SCOPE V2 "))) {
+            const bool isScopeV2 = line.startsWith(QStringLiteral("SCOPE V2 "));
+            const QRegularExpression sequenceExpr(QStringLiteral("\\bseq=(\\d+)"));
+            const QRegularExpression eventRecordExpr(QStringLiteral("\\bevent_seq=(\\d+)"));
+            const QRegularExpression eventChannelExpr(QStringLiteral("\\bevent_channel=(\\d+)"));
+            const QRegularExpression eventWordSequenceExpr(QStringLiteral("\\bevent_word_seq=(\\d+)"));
             const QRegularExpression samplesExpr(QStringLiteral("\\bsamples=(\\d+)"));
             const QRegularExpression bytesExpr(QStringLiteral("\\bbytes=(\\d+)"));
             const QRegularExpression rateExpr(QStringLiteral("\\bfs=(\\d+)"));
             const QRegularExpression crcExpr(QStringLiteral("\\bcrc32=([0-9a-fA-F]{8})"));
+            const auto sequenceMatch = sequenceExpr.match(line);
+            const auto eventRecordMatch = eventRecordExpr.match(line);
+            const auto eventChannelMatch = eventChannelExpr.match(line);
+            const auto eventWordSequenceMatch = eventWordSequenceExpr.match(line);
             const auto samplesMatch = samplesExpr.match(line);
             const auto bytesMatch = bytesExpr.match(line);
             const auto rateMatch = rateExpr.match(line);
             const auto crcMatch = crcExpr.match(line);
-            if (!samplesMatch.hasMatch() || !bytesMatch.hasMatch() || !rateMatch.hasMatch() ||
-                !crcMatch.hasMatch()) {
+            if (!sequenceMatch.hasMatch() || !samplesMatch.hasMatch() || !bytesMatch.hasMatch() || !rateMatch.hasMatch() ||
+                !crcMatch.hasMatch() ||
+                (isScopeV2 && (!eventRecordMatch.hasMatch() || !eventChannelMatch.hasMatch() ||
+                               !eventWordSequenceMatch.hasMatch()))) {
                 emit downloadFailed(QStringLiteral("SCOPE 帧头格式错误：%1").arg(line));
                 resetDownload();
                 return;
             }
+            m_scopeSequence = sequenceMatch.captured(1).toUInt();
+            m_scopeEventRecordSequence = isScopeV2 ? eventRecordMatch.captured(1).toUInt() : 0U;
+            m_scopeEventChannel = isScopeV2 ? eventChannelMatch.captured(1).toUInt() : 0xFFFFFFFFU;
+            m_scopeEventWordSequence = isScopeV2 ? eventWordSequenceMatch.captured(1).toUInt() : 0U;
             m_scopeSamples = samplesMatch.captured(1).toUInt();
             m_expectedBytes = bytesMatch.captured(1).toUInt();
             m_scopeSampleRateHz = rateMatch.captured(1).toUInt();
@@ -226,6 +267,46 @@ void PdTcpClient::processTextLines()
                 return;
             }
             m_expectedKind = QStringLiteral("SCOPE");
+            m_mode = ReceiveMode::Binary;
+            emit textLine(line);
+            return;
+        }
+        if (line.startsWith(QStringLiteral("SCOPE_FFT V1 "))) {
+            const auto parseField = [&line](const QString &name, quint32 &value) {
+                const QRegularExpression expression(
+                    QStringLiteral("\\b%1=(\\d+)").arg(QRegularExpression::escape(name)));
+                const auto match = expression.match(line);
+                if (!match.hasMatch()) return false;
+                bool ok = false;
+                value = match.captured(1).toUInt(&ok);
+                return ok;
+            };
+            const QRegularExpression crcExpr(QStringLiteral("\\bcrc32=([0-9a-fA-F]{8})"));
+            const auto crcMatch = crcExpr.match(line);
+            quint32 points = 0U, bytes = 0U, binHz = 0U;
+            if (!parseField(QStringLiteral("seq"), m_scopeFftSequence) ||
+                !parseField(QStringLiteral("channel"), m_scopeFftChannel) ||
+                !parseField(QStringLiteral("points"), points) ||
+                !parseField(QStringLiteral("fs"), m_scopeFftSampleRateHz) ||
+                !parseField(QStringLiteral("bin_hz"), binHz) ||
+                !parseField(QStringLiteral("peak_bin"), m_scopeFftPeakBin) ||
+                !parseField(QStringLiteral("peak_hz"), m_scopeFftPeakHz) ||
+                !parseField(QStringLiteral("amplitude"), m_scopeFftAmplitudeCode) ||
+                !parseField(QStringLiteral("dc"), m_scopeFftDcCode) ||
+                !parseField(QStringLiteral("bytes"), bytes) || !crcMatch.hasMatch()) {
+                emit downloadFailed(QStringLiteral("SCOPE_FFT 帧头格式错误：%1").arg(line));
+                resetDownload();
+                return;
+            }
+            m_expectedBytes = bytes;
+            m_expectedCrc = crcMatch.captured(1).toUInt(nullptr, 16);
+            if (m_scopeFftChannel >= 4U || points != 1024U || binHz == 0U ||
+                m_expectedBytes != 513U * 2U || m_scopeFftSampleRateHz == 0U) {
+                emit downloadFailed(QStringLiteral("SCOPE_FFT 参数无效：%1").arg(line));
+                resetDownload();
+                return;
+            }
+            m_expectedKind = QStringLiteral("SCOPE_FFT");
             m_mode = ReceiveMode::Binary;
             emit textLine(line);
             return;
@@ -243,6 +324,8 @@ void PdTcpClient::processBinary()
     /* 实时示波器帧不进下载进度条：它不是"文件下载"，混进去会让进度条每帧乱跳。 */
     if (m_wholeSnapshot)
         emit downloadProgress(m_wholeOffset + m_download.size(), m_wholeBytes);
+    else if (m_wholeEventRecord)
+        emit downloadProgress(m_wholeEventOffset + m_download.size(), m_wholeEventBytes);
     else if (m_expectedKind != QStringLiteral("SCOPE"))
         emit downloadProgress(m_download.size(), m_expectedBytes);
     if (static_cast<quint32>(m_download.size()) != m_expectedBytes) return;
@@ -260,8 +343,53 @@ void PdTcpClient::processBinary()
         const QByteArray frame = m_download;
         const quint32 samples = m_scopeSamples;
         const quint32 sampleRateHz = m_scopeSampleRateHz;
+        const quint32 sequence = m_scopeSequence;
+        const quint32 eventRecordSequence = m_scopeEventRecordSequence;
+        const quint32 eventChannel = m_scopeEventChannel;
+        const quint32 eventWordSequence = m_scopeEventWordSequence;
         resetDownload();
-        emit scopeFrame(frame, samples, sampleRateHz);
+        emit scopeFrame(frame, samples, sampleRateHz, sequence,
+                        eventRecordSequence, eventChannel, eventWordSequence);
+        if (!m_rx.isEmpty()) processTextLines();
+        return;
+    }
+    if (m_expectedKind == QStringLiteral("SCOPE_FFT")) {
+        const QByteArray bins = m_download;
+        const quint32 sequence = m_scopeFftSequence;
+        const quint32 channel = m_scopeFftChannel;
+        const quint32 sampleRateHz = m_scopeFftSampleRateHz;
+        const quint32 peakBin = m_scopeFftPeakBin;
+        const quint32 peakHz = m_scopeFftPeakHz;
+        const quint32 amplitudeCode = m_scopeFftAmplitudeCode;
+        const quint32 dcCode = m_scopeFftDcCode;
+        resetDownload();
+        emit scopeSpectrumFrame(bins, sequence, channel, sampleRateHz,
+                                peakBin, peakHz, amplitudeCode, dcCode);
+        if (!m_rx.isEmpty()) processTextLines();
+        return;
+    }
+    if (m_wholeEventRecord) {
+        QFile output(m_destination);
+        if (!output.open(QIODevice::WriteOnly | QIODevice::Append)) {
+            emit downloadFailed(QStringLiteral("无法写入文件：%1").arg(m_destination));
+            resetDownload();
+            return;
+        }
+        output.write(m_download);
+        output.close();
+        m_wholeEventOffset += m_expectedBytes;
+        if (m_wholeEventOffset < m_wholeEventBytes) {
+            m_mode = ReceiveMode::Text;
+            m_expectedBytes = 0U;
+            m_expectedCrc = 0U;
+            m_download.clear();
+            beginNextEventChunk();
+            return;
+        }
+        const QString path = m_destination;
+        const quint32 bytes = m_wholeEventBytes;
+        resetDownload();
+        emit downloadComplete(path, bytes, 0U, QStringLiteral("EVENT"));
         if (!m_rx.isEmpty()) processTextLines();
         return;
     }
@@ -312,6 +440,15 @@ void PdTcpClient::beginNextWholeChunk()
                     .arg(m_wholeSnapshotIndex).arg(m_wholeOffset).arg(bytes));
 }
 
+void PdTcpClient::beginNextEventChunk()
+{
+    const quint32 remaining = m_wholeEventBytes - m_wholeEventOffset;
+    const quint32 bytes = qMin<quint32>(remaining, 16384U);
+    m_expectedKind = QStringLiteral("EVENT");
+    sendCommand(QStringLiteral("GET EVENT SEQ %1 %2 %3")
+                    .arg(m_wholeEventSequence).arg(m_wholeEventOffset).arg(bytes));
+}
+
 void PdTcpClient::resetDownload()
 {
     m_mode = ReceiveMode::Text;
@@ -321,8 +458,23 @@ void PdTcpClient::resetDownload()
     m_expectedCrc = 0;
     m_scopeSamples = 0;
     m_scopeSampleRateHz = 0;
+    m_scopeSequence = 0;
+    m_scopeEventRecordSequence = 0;
+    m_scopeEventChannel = 0xFFFFFFFFU;
+    m_scopeEventWordSequence = 0;
+    m_scopeFftSequence = 0;
+    m_scopeFftChannel = 0;
+    m_scopeFftSampleRateHz = 0;
+    m_scopeFftPeakBin = 0;
+    m_scopeFftPeakHz = 0;
+    m_scopeFftAmplitudeCode = 0;
+    m_scopeFftDcCode = 0;
     m_download.clear();
     m_wholeSnapshot = false;
+    m_wholeEventRecord = false;
+    m_wholeEventSequence = 0;
+    m_wholeEventBytes = 0;
+    m_wholeEventOffset = 0;
     m_wholeSnapshotBySequence = false;
     m_wholeSnapshotSequence = 0;
     m_wholeSnapshotIndex = 0;

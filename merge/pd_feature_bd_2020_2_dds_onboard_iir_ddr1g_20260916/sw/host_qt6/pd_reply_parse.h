@@ -41,6 +41,8 @@ struct Config {
     quint32 scopeMaxSamples = 0;
     quint32 snapSlots = 0;
     quint32 eventSlots = 0;
+    bool hasScaleQ88 = false;
+    quint32 scaleQ88[4] = {0U, 0U, 0U, 0U};
 };
 
 struct EventMeta {

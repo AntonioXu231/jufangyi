@@ -220,8 +220,8 @@ assign full = (wr_ptr_gray == full_cmp_gray);
 
 | 从机 | 地址块 | 基址 | 范围 | 对应逻辑 |
 |---|---|---|---|---|
-| `pd_feature_0/s_axi` | `SEG_pd_feature_0_reg0` | **0x4000_0000** | 64K | 特征提取寄存器（`pd_axil_regs`） |
-| `pd_ddr_0/s_axi` | `SEG_pd_ddr_0_reg0` | **0x4001_0000** | 64K | DDR 环形/快照寄存器（`pd_ddr_axil`） |
+| `pd_ddr_0/s_axi` | `SEG_pd_ddr_0_reg0` | **0x4000_0000** | 64K | DDR 环形/快照寄存器（`pd_ddr_axil`） |
+| `pd_feature_0/s_axi` | `SEG_pd_feature_0_reg0` | **0x4001_0000** | 64K | 特征提取寄存器（`pd_axil_regs`） |
 | `pd_filter_0/S_AXI` | `SEG_pd_filter_0_reg0` | **0x4002_0000** | 64K | 滤波链寄存器（`pd_filter_chain`） |
 | `axi_dma_0/S_AXI_LITE` | `SEG_axi_dma_0_Reg` | **0x4040_0000** | 64K | AXI DMA 寄存器 |
 
@@ -294,14 +294,14 @@ assign full = (wr_ptr_gray == full_cmp_gray);
 - 区域划分：`0x0000~0x07FF` 通道区（`addr[15:12]=0`）、`0x1000~0x1FFF` 全局区（`=1`）、`0x2000~0x21FF` 计数器区（`=2`）、`0x4000~0x7FFF` PRPD 区（`=4`）。
 - 坑：因为区域选择只看 `addr[15:12]`，任何区域基址都必须是 **4KB（0x1000）对齐**，否则会掉进别的区域码。早期把全局区放 `0x0800`（仍属 `addr[15:12]=0`）就是踩了这个坑。
 
-### 8.2 `pd_ddr_axil` 用页内偏移，而 BD 映射到 `0x4001_0000`
+### 8.2 `pd_ddr_axil` 用页内偏移，而 BD 映射到 `0x4000_0000`
 
 - `pd_ddr_axil` 解码只看 `s_axi_awaddr[11:0]`（页内 12 位偏移，`:201`、`:254`、`:310`、`:314`），即它**不关心页号**，只认"自己在哪个 4KB 页内的偏移"。
-- 但 BD 把该从机映射到 **`0x4001_0000`**（第 6.1 节 addressing：`SEG_pd_ddr_0_reg0` offset `0x40010000`）。
+- 但当前 BD 把该从机映射到 **`0x4000_0000`**（第 6.1 节 addressing：`SEG_pd_ddr_0_reg0` offset `0x40000000`）。
 - 契约差异：该从机头注释（`pd_ddr_axil.v:8`）说"使用独立 4KB 页 0x2000（addr[15:12]=2），冻结组保持契约偏移 0x28/0x2C/0x30/0x34"。也就是说：
   - **契约文档（v3）** 假定它在页 `0x1000`（与 `pd_axil_regs` 全局区同页），冻结寄存器在 `0x1028/0x102C/0x1030/0x1034`；
-  - **实际实现** 它在独立页 `0x2000`，且 BD 又把它放到 PS 地址 `0x4001_0000`（页号由互联决定）。
-- 因此 PS 访问时，**实际地址 = 0x40010000 + 页内偏移**（如 `FREEZE_CTRL` 实际 = `0x40010000 + 0x34 = 0x40010034`），而契约里写的是 `0x1034`。`pd_hw_map.h` 与 `pd_snapshot_poll.c` 都用 `PD_DDR_BASE(=0x40010000) + 偏移` 访问，与硬件一致；但若有人照契约文档的 `0x1034` 直接写就会写错从机。这是"契约地址（逻辑页内偏移）"与"实际地址（BD 映射后的物理页基址+偏移）"的典型差异，维护时必须以 BD addressing 为准。
+  - **实际实现** 它在独立页 `0x2000`，而当前 BD 将该 AXI-Lite segment 映射到 PS 地址 `0x4000_0000`。
+- 因此 PS 访问时，**实际地址 = 0x40000000 + 页内偏移**（如 `FREEZE_CTRL` 实际 = `0x40000000 + 0x34 = 0x40000034`），而契约里写的是 `0x1034`。当前 `pd_hw_map.h` 与 `pd_snapshot_poll.c` 应使用 `PD_DDR_BASE(=0x40000000) + 偏移`；若仍使用旧 BSP/XSA，必须先确认其生成宏是否匹配当前 BD。这是"契约地址（逻辑页内偏移）"与"实际地址（BD 映射后的物理页基址+偏移）"的典型差异，维护时必须以当前 BD addressing 和活动 `xparameters.h` 为准。
 
 ---
 

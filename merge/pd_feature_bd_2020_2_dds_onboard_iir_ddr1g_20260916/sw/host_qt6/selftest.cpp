@@ -582,6 +582,22 @@ void testBoardReplies()
               QStringLiteral("CONFIG 含 scope 字段 => 固件支持 SCOPE（1024/2048）"));
     }
     {
+        const auto c = pdreply::parseConfig(QStringLiteral(
+            "CONFIG api=16 default_limit=128 event_slots=2048 event_stride=65536 snap_slots=4 "
+            "scope=0/0 scope_fft=ps_q15_1024x1_bins513 "
+            "scale_q88=256,256,512,256 alert_mask=0xf state=0"));
+        check(c.ok && c.hasScaleQ88 && c.scaleQ88[0] == 256U &&
+                  c.scaleQ88[1] == 256U && c.scaleQ88[2] == 512U &&
+                  c.scaleQ88[3] == 256U,
+              QStringLiteral("CONFIG 解析四通道 SCALE(Q8.8)，保留通道差异"));
+    }
+    {
+        const auto c = pdreply::parseConfig(QStringLiteral(
+            "CONFIG api=16 scope=1024/2048 scale_q88=256,0,256,256"));
+        check(c.ok && !c.hasScaleQ88,
+              QStringLiteral("CONFIG 的零 SCALE 视为无效，不能静默标定"));
+    }
+    {
         /* 旧固件没有 scope 字段：必须判 hasScope=false，上位机据此明确报错，
            而不是发 SCOPE ON 拿到 "unknown command" 后静默空转。 */
         const auto c = pdreply::parseConfig(QStringLiteral(

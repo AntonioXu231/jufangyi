@@ -16,7 +16,8 @@ class QTimer;
  *   - 必须先处于采集运行态（state != 0），SCOPE 才被接受；
  *   - SCOPE ON [samples]，samples ∈ [256, 2048] 且为 4 的倍数，默认 1024；
  *   - SCOPE NEXT 每次只返回一帧，帧头 "SCOPE V1 seq= samples= bytes= fs= crc32="；
- *     SCOPE EVENT SEQ n 返回最新完整快照中按 PL 相位对齐的 "SCOPE V2" 事件中心帧；
+ *     SCOPE EVENT SEQ record samples channel evt_seq 按事件字选择脉冲，再从最新快照
+ *     取相位近似窗口；快照缺少事件周期/样本时间戳关联，不能保证是同一瞬态脉冲；
  *     后紧跟 bytes 个二进制字节，bytes = samples×6；
  *   - 一次只能有一个传输在途，第二个 NEXT 会回 "ERR SCOPE transfer is still active"；
  *   - 帧内容是 DDR 环上"距离写指针 24 KiB 之前"的一个窗口，不是归档快照。
@@ -24,7 +25,7 @@ class QTimer;
  * 本类负责：自动编排（必要时先 START 0）、帧节奏控制、在途互斥、CRC 校验结果
  * 汇总、超时看门狗与重试、按 seq 检测跳帧、以及触发判定。
  *
- * 事件中心帧只增加 PS TCP 读取路径，不改变 PL 事件/DDR 快照格式；
+ * 事件候选窗口只增加 PS TCP 读取路径，不改变 PL 事件/DDR 快照格式；
  * 它与连续 SCOPE 帧共享同一 TCP 二进制互斥。
  */
 class ScopeStream final : public QObject
@@ -93,7 +94,7 @@ public:
     bool isFrameInFlight() const { return m_frameInFlight; }
     /* Queue a waveform request centred on a retained PL event sequence.  The
        request is serialized behind any live/SCOPE transfer already in flight. */
-    void requestEventFrame(quint32 eventSequence);
+    void requestEventFrame(quint32 eventSequence, quint32 channel, quint32 eventWordSequence);
 
     State state() const { return m_state; }
     bool isRunning() const;
@@ -111,8 +112,10 @@ public slots:
 
 signals:
     void liveFrame(const pdsample::WaveformFrame &frame, int triggerIndex, bool triggerValid);
-    void eventFrame(const pdsample::WaveformFrame &frame, quint32 eventSequence);
-    void eventFrameFailed(quint32 eventSequence, const QString &reason);
+    void eventFrame(const pdsample::WaveformFrame &frame, quint32 eventSequence,
+                    quint32 channel, quint32 eventWordSequence);
+    void eventFrameFailed(quint32 eventSequence, quint32 channel,
+                          quint32 eventWordSequence, const QString &reason);
     void rollFrame(const pdsample::WaveformFrame &frame);
     void stateChanged(ScopeStream::State state, const QString &message);
     void statisticsChanged();
@@ -122,7 +125,9 @@ signals:
 
 private slots:
     void onTextLine(const QString &line);
-    void onScopeFrame(const QByteArray &raw, quint32 samples, quint32 sampleRateHz);
+    void onScopeFrame(const QByteArray &raw, quint32 samples, quint32 sampleRateHz,
+                      quint32 sequence, quint32 eventRecordSequence,
+                      quint32 eventChannel, quint32 eventWordSequence);
     void onDownloadFailed(const QString &reason);
     void onTransportError(const QString &message);
     void onWatchdog();
@@ -160,7 +165,11 @@ private:
     bool m_eventRequestPending = false;
     bool m_eventFrameInFlight = false;
     quint32 m_pendingEventSequence = 0U;
+    quint32 m_pendingEventChannel = 0U;
+    quint32 m_pendingEventWordSequence = 0U;
     quint32 m_eventSequenceInFlight = 0U;
+    quint32 m_eventChannelInFlight = 0U;
+    quint32 m_eventWordSequenceInFlight = 0U;
     int m_consecutiveTimeouts = 0;
     int m_transportRetries = 0;
 

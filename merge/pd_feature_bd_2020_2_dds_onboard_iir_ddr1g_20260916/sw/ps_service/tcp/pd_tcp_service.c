@@ -161,6 +161,33 @@ static int parse_one_or_two_u32(char *text, u32 *first, u32 *second)
     return *cursor == 0 ? 0 : -1;
 }
 
+/* SCOPE EVENT accepts: record_seq [samples [channel evt_seq]]. */
+static int parse_scope_event_args(char *text, u32 *record_sequence, u32 *samples,
+                                 u32 *channel, u32 *event_word_sequence,
+                                 u32 *has_event_selector)
+{
+    char *cursor = text;
+    *samples = 0U;
+    *channel = 0U;
+    *event_word_sequence = 0U;
+    *has_event_selector = 0U;
+    if (read_u32(&cursor, record_sequence) != 0) return -1;
+    while (*cursor == ' ') ++cursor;
+    if (*cursor == 0) return 0;
+    if (read_u32(&cursor, samples) != 0) return -1;
+    while (*cursor == ' ') ++cursor;
+    if (*cursor == 0) return 0;
+    if (read_u32(&cursor, channel) != 0 || *channel >= PD_SNAPSHOT_CHANNELS)
+        return -1;
+    if (read_u32(&cursor, event_word_sequence) != 0 ||
+        *event_word_sequence > 0x01FFFFFFU)
+        return -1;
+    while (*cursor == ' ') ++cursor;
+    if (*cursor != 0) return -1;
+    *has_event_selector = 1U;
+    return 0;
+}
+
 static void transfer_pump(void)
 {
     u16_t chunk;
@@ -205,14 +232,21 @@ static void reply_status(void)
 
 static void reply_config(void)
 {
-    char out[384];
+    u32 scale[4];
+    u32 channel;
+    char out[512];
+
+    for (channel = 0U; channel < 4U; ++channel)
+        scale[channel] = Xil_In32(PD_FEATURE_BASE + PD_FEATURE_SCALE(channel)) & 0xFFFFU;
     (void)snprintf(out, sizeof(out),
-        "CONFIG api=16 default_limit=%lu event_slots=%u event_stride=%lu snap_slots=%u snap_stride=%lu analysis_slots=%u sweep_slots=%u sweep_windows=%u prpd_bins=%u scope=%lu/%lu scope_fft=ps_q15_1024x1_bins513 scope_env=cycle520000_bins1024_ch4_minmax16 alert_mask=%lx alert_delta=%ld get_max=%u state=%lu\r\n",
+        "CONFIG api=16 default_limit=%lu event_slots=%u event_stride=%lu snap_slots=%u snap_stride=%lu analysis_slots=%u sweep_slots=%u sweep_windows=%u prpd_bins=%u scope=%lu/%lu scope_fft=ps_q15_1024x1_bins513 scope_env=cycle520000_bins1024_ch4_minmax16 scale_q88=%lu,%lu,%lu,%lu alert_mask=%lx alert_delta=%ld get_max=%u state=%lu\r\n",
         (unsigned long)pd_acq_default_packet_limit(), PD_EVENT_ARCHIVE_COUNT,
         (unsigned long)PD_EVENT_ARCHIVE_STRIDE, PD_SNAP_ARCHIVE_COUNT,
         (unsigned long)PD_SNAP_ARCHIVE_STRIDE, PD_ANALYSIS_ARCHIVE_COUNT,
         PD_ANALYSIS_ARCHIVE_COUNT, PD_ANALYSIS_SWEEP_WINDOWS, PD_PRPD_PHASE_BINS,
         (unsigned long)s_scope.enabled, (unsigned long)s_scope.samples,
+        (unsigned long)scale[0], (unsigned long)scale[1],
+        (unsigned long)scale[2], (unsigned long)scale[3],
         (unsigned long)s_alert_channel_mask, (long)s_alert_delta_permille,
         PD_TCP_GET_MAX_BYTES,
         (unsigned long)pd_acq_state());
@@ -1173,22 +1207,23 @@ static void start_scope_fft(char *text)
 /*
  * Return a waveform window centred on a retained PL peak event.
  *
- * The PL event packet intentionally carries phase (not a DDR byte address),
- * while the snapshot writer freezes a complete 50 Hz cycle on cycle_start.
- * Therefore the event phase can be mapped into the newest archived cycle and
- * a short, event-centred raw window can be streamed without changing the
- * 64-bit PL event protocol.  The snapshot/event records are allowed to differ
- * by a few cycles; the header exposes both sequence numbers so the host can
- * show this correlation explicitly.
+ * The PL event packet carries phase but no sample timestamp or DDR byte
+ * address. This selects the requested event word exactly, then maps its phase
+ * into the newest archived 50 Hz snapshot as a best-effort candidate window.
+ * The snapshot record has no cycle/sample ID proving that it contains that
+ * event's transient; the header exposes both independent sequence numbers so
+ * the host can avoid presenting this as guaranteed time correlation.
  */
-static void start_scope_event(u32 event_sequence, u32 samples)
+static void start_scope_event(u32 event_sequence, u32 samples,
+                              u32 has_event_selector, u32 requested_channel,
+                              u32 requested_event_word_sequence)
 {
     pd_event_record_t event_record;
     pd_snapshot_record_t snapshot_record;
     const u64 *event_words;
     u32 latest_snapshot;
-    u32 phase = 0U, channel = 0U, phase_win;
-    u32 i, total_samples, center, start, bytes, sum;
+    u32 phase = 0U, channel = 0U, phase_win, event_word_sequence = 0U;
+    u32 i, total_samples, center, start, bytes, sum, scope_sequence;
     int have_peak = 0;
     char out[256];
 
@@ -1224,14 +1259,23 @@ static void start_scope_event(u32 event_sequence, u32 samples)
         const u64 word = event_words[i];
         /* Peak words have type 0x00; cycle summaries have type 0x01. */
         if ((u32)(word >> 56) == 0U) {
+            const u32 word_channel = (u32)((word >> 25) & 0x3U);
+            const u32 word_sequence = (u32)(word & 0x01FFFFFFU);
+            if (has_event_selector != 0U &&
+                (word_channel != requested_channel ||
+                 word_sequence != requested_event_word_sequence))
+                continue;
             phase = (u32)((word >> 28) & 0xFFFU);
-            channel = (u32)((word >> 25) & 0x3U);
+            channel = word_channel;
+            event_word_sequence = word_sequence;
             have_peak = 1;
             break;
         }
     }
     if (!have_peak) {
-        (void)reply("ERR SCOPE event has no peak word\r\n");
+        (void)reply(has_event_selector != 0U ?
+                    "ERR SCOPE event selector is not present in this record\r\n" :
+                    "ERR SCOPE event has no peak word\r\n");
         return;
     }
 
@@ -1269,14 +1313,17 @@ static void start_scope_event(u32 event_sequence, u32 samples)
         dst[5] = (u8)((sample[3] >> 4) & 0xFFU);
     }
     sum = crc32(s_scope_buffer, bytes);
+    scope_sequence = s_scope.sequence++;
+    s_scope.last_frame_sequence = scope_sequence;
+    s_scope.last_frame_valid = 1U;
     latest_snapshot = snapshot_record.sequence;
     (void)snprintf(out, sizeof(out),
-        "SCOPE V2 seq=%lu samples=%lu bytes=%lu fs=26000000 crc32=%08lx source=SNAP snap_seq=%lu event_seq=%lu start=%lu center=%lu phase=%lu channel=%lu\r\n",
-        (unsigned long)s_scope.sequence++, (unsigned long)samples,
+        "SCOPE V2 seq=%lu samples=%lu bytes=%lu fs=26000000 crc32=%08lx source=SNAP snap_seq=%lu event_seq=%lu event_channel=%lu event_word_seq=%lu start=%lu center=%lu phase=%lu\r\n",
+        (unsigned long)scope_sequence, (unsigned long)samples,
         (unsigned long)bytes, (unsigned long)sum,
         (unsigned long)latest_snapshot, (unsigned long)event_sequence,
-        (unsigned long)start, (unsigned long)center, (unsigned long)phase,
-        (unsigned long)channel);
+        (unsigned long)channel, (unsigned long)event_word_sequence,
+        (unsigned long)start, (unsigned long)center, (unsigned long)phase);
     if (reply(out) != 0) return;
     s_transfer.addr = (UINTPTR)s_scope_buffer;
     s_transfer.offset = 0U;
@@ -1554,9 +1601,12 @@ static void start_scope(char *line)
     }
     if (strncmp(p, "EVENT SEQ ", 10) == 0) {
         char *cursor = p + 10;
-        u32 event_sequence, event_samples = s_scope.samples;
-        if (parse_one_or_two_u32(cursor, &event_sequence, &event_samples) != 0) {
-            (void)reply("ERR usage: SCOPE EVENT SEQ sequence [samples]\r\n");
+        u32 event_sequence, event_samples, event_channel, event_word_sequence;
+        u32 has_event_selector;
+        if (parse_scope_event_args(cursor, &event_sequence, &event_samples,
+                                   &event_channel, &event_word_sequence,
+                                   &has_event_selector) != 0) {
+            (void)reply("ERR usage: SCOPE EVENT SEQ sequence [samples [channel event_word_seq]]\r\n");
             return;
         }
         if (event_samples == 0U) event_samples = s_scope.samples;
@@ -1565,7 +1615,8 @@ static void start_scope(char *line)
             (void)reply("ERR SCOPE samples must be 256..2048 and divisible by 4\r\n");
             return;
         }
-        start_scope_event(event_sequence, event_samples);
+        start_scope_event(event_sequence, event_samples, has_event_selector,
+                          event_channel, event_word_sequence);
         return;
     }
     if (strncmp(p, "PEAKS", 5) == 0 && p[5] == 0) {
@@ -1577,7 +1628,7 @@ static void start_scope(char *line)
         return;
     }
     if (strncmp(p, "ON", 2) != 0 || (p[2] != 0 && p[2] != ' ')) {
-        (void)reply("ERR usage: SCOPE ON [samples] | NEXT | ENVELOPE | FFT CHANNEL channel(0..3) | EVENT SEQ n [samples] | PEAKS | PHASE | OFF\r\n");
+        (void)reply("ERR usage: SCOPE ON [samples] | NEXT | ENVELOPE | FFT CHANNEL channel(0..3) | EVENT SEQ seq [samples [channel evt_seq]] | PEAKS | PHASE | OFF\r\n");
         return;
     }
     p += 2;
@@ -1703,7 +1754,7 @@ static void execute_command(char *line)
     if (s_transfer.active || s_scope_envelope.active || s_scope_envelope.ready)
         return; /* Never interleave text and raw payload/job response. */
     if (strcmp(line, "HELP") == 0) {
-        (void)reply("CMD: START [n] | STOP | STATUS | CONFIG | SCOPE ON [samples]|NEXT|ENVELOPE|FFT CHANNEL n(0..3)|EVENT SEQ n [samples]|PEAKS|PHASE|OFF | REPORT | SET LIMIT n | SET FFTFS hz | SET ALERT DELTA n|MASK n | ALERT CONFIG|SWEEP n|SNAP SEQ n | RECOVER | CATALOG | EVENT n|SEQ n|DETAIL n|DETAIL SEQ n | PRPD SUMMARY|BINS ch first [count] | SNAP n|SEQ n | ANALYZE SNAP n|SEQ n | FFT CONFIG|SELFTEST|SNAP n|SEQ n [start]|AUTO SNAP n|SEQ n | SPECTRUM [AUTO] SNAP n|SEQ n [start] | ANALYSIS n|SNAP SEQ n|CATALOG | SWEEP AUTO SNAP n|SEQ n|CATALOG|INDEX n|WINDOW n 0..4|SNAP SEQ n | FEATURE SWEEP n|SNAP SEQ n | BATCH AUTO | GET EVENT|SNAP n|SEQ n offset bytes | CLEAR\r\n");
+        (void)reply("CMD: START [n] | STOP | STATUS | CONFIG | SCOPE ON [samples]|NEXT|ENVELOPE|FFT CHANNEL n(0..3)|EVENT SEQ seq [samples [channel evt_seq]]|PEAKS|PHASE|OFF | REPORT | SET LIMIT n | SET FFTFS hz | SET ALERT DELTA n|MASK n | ALERT CONFIG|SWEEP n|SNAP SEQ n | RECOVER | CATALOG | EVENT n|SEQ n|DETAIL n|DETAIL SEQ n | PRPD SUMMARY|BINS ch first [count] | SNAP n|SEQ n | ANALYZE SNAP n|SEQ n | FFT CONFIG|SELFTEST|SNAP n|SEQ n [start]|AUTO SNAP n|SEQ n | SPECTRUM [AUTO] SNAP n|SEQ n [start] | ANALYSIS n|SNAP SEQ n|CATALOG | SWEEP AUTO SNAP n|SEQ n|CATALOG|INDEX n|WINDOW n 0..4|SNAP SEQ n | FEATURE SWEEP n|SNAP SEQ n | BATCH AUTO | GET EVENT|SNAP n|SEQ n offset bytes | CLEAR\r\n");
     } else if (strncmp(line, "START", 5) == 0 && (line[5] == 0 || line[5] == ' ')) {
         if (pd_acq_state() != PD_ACQ_IDLE) (void)reply("ERR already running\r\n");
         else if (pd_acq_start(parse_u32(line + 5, pd_acq_default_packet_limit())) == XST_SUCCESS)

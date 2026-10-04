@@ -15,9 +15,11 @@
 //        -> pd_feature_top (峰值/1024 相位窗/n·I·P·Q/PRPD/8B 事件包)
 //        -> M_AXIS (事件流, type=0x00/0x01) / AXI-Lite (配置与状态)
 //
-// 速率配置: 当前验证默认 130MHz / 26MSPS (CDC 5:1)。
-//           若后续切回生产更高速率，必须同步修改 BD 的 SAMPLE_HZ、ADC
-//           时钟属性与 XDC，且保持 CLK_HZ/SAMPLE_HZ 为整数。
+// 速率配置: 当前工程为 130MHz / 26MSPS。
+//           INPUT_CDC=1 的独立逐通道 CDC 与 INPUT_CDC=2 的打包 CDC 均按标称整数比读；
+//           两种可选路径都要求 CLK_HZ/SAMPLE_HZ 为整数，独立时钟漂移的长期速率匹配
+//           尚未实现。当前工程 INPUT_CDC=0，使用上游公共同步采集路径。
+//           改采样率仍需同步更新 BD 的 SAMPLE_HZ、ADC 时钟属性与 XDC。
 //
 // 说明: project_2 自带的 axil_regs_4ch(采集侧寄存器) 与 axis_master_4ch
 //       (原始样本流 type=0xA1) 与契约冲突, 已在此合并中剔除, 统一使用
@@ -30,7 +32,7 @@ module pd_feature_sys_top #(
     parameter integer NUM_CH    = 4,
     parameter integer ADC_W     = `PD_ADC_W,
     parameter integer CLK_HZ    = 130000000,   // 系统时钟 (Hz), PL 主时钟
-    parameter integer SAMPLE_HZ = 26000000,    // ADC 采样率 (Hz), 必须整除 CLK_HZ
+    parameter integer SAMPLE_HZ = 26000000,    // ADC 采样率 (Hz); INPUT_CDC=1/2 require integer ratio
     // 0: adc_data/adc_dv 已由上游公共 CDC 送入 clk 域（当前工程配置）。
     // 1: 兼容旧的四路独立 adc_clk -> clk CDC。
     // 2: 四通道同一 48-bit FIFO 原子 CDC，供直接 ADC 时钟域输入使用。

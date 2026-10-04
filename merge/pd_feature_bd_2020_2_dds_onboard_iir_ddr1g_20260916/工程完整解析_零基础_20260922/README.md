@@ -98,7 +98,7 @@
 | 一份快照 | **3,120,000 字节** = 130,000 块 = 520,000 采样点 ≈ 一个 50 Hz 周期 | `pd_ddr_defines.vh:122-124` |
 | 环形区 | `0x1000_2000` ~ `0x1800_0000`，128 MiB − 8 KiB | `pd_ddr_defines.vh:80-81` |
 | 四槽快照区 | `0x2000_1000` 起，4 槽 × 12 MiB，总跨度 48 MiB | `pd_ddr_defines.vh:131-139` |
-| AXI-Lite 地址 | feature `0x4000_0000` / ddr `0x4001_0000` / filter `0x4002_0000` / dma `0x4040_0000` | `.bd` `addressing` 段 |
+| AXI-Lite 地址 | ddr `0x4000_0000` / feature `0x4001_0000` / filter `0x4002_0000` / dma `0x4040_0000` | 当前 `.bd` `addressing` 段及用户提供的 `xparameters.h` 宏 |
 | **当前时序** | ⭐ **WNS 0.000 / TNS 0.000 / 失配端点 0（总端点 98513）；WHS +0.017 / THS 0.000**；报告结论 `All user specified timing constraints are met.` | `pd_feature_bd_2020_2.runs/impl_1/pd_feature_bd_wrapper_timing_summary_routed.rpt:131,134`（2026-09-21 19:20 的 routed 报告） |
 | **当前资源** | Slice LUT **27,965 / 53,200 = 52.57%**；Slice Registers **33,524 / 106,400 = 31.51%**；Block RAM Tile **32.5 / 140 = 23.21%**；DSP **28 / 220 = 12.73%** | `…/impl_1/pd_feature_bd_wrapper_utilization_placed.rpt:34,39,104,119` |
 | **数据路径** | HP0 ← `pd_ddr_0/m_axi_wr` + `axi_dma_0/M_AXI_S2MM`；HP1 ← `pd_ddr_0/m_axi_rd` + `pd_ddr_0/m_axi_cw` | `.bd` `interface_nets` 段 |

@@ -135,6 +135,14 @@ void EllipsePanel::clear()
     update();
 }
 
+void EllipsePanel::setAgingSeconds(double seconds)
+{
+    m_agingSeconds = qMax(0.0, seconds);
+    prune();
+    rebuildCaches();
+    update();
+}
+
 void EllipsePanel::prune()
 {
     if (m_count <= 0) return;

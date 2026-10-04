@@ -82,15 +82,15 @@
 ## 3. 地址空间：CPU 怎么访问 PL 里的寄存器（含本工程真实地址）
 
 ### 直觉/比喻
-PS 把整块芯片（包括 PL 里的寄存器、自己的 DDR、自己的外设）看成一条**很长的街道，门牌号就是地址**。CPU 说"去 0x4001_0000 号房子读一个 32 位数"，总线就会把请求送到那栋房子（这里是 `pd_ddr_0` 模块的寄存器）。写寄存器就是"往某个门牌号塞一个值"。
+PS 把整块芯片（包括 PL 里的寄存器、自己的 DDR、自己的外设）看成一条**很长的街道，门牌号就是地址**。CPU 说"去 0x4000_0000 号房子读一个 32 位数"，总线就会把请求送到那栋房子（这里是 `pd_ddr_0` 模块的寄存器）。写寄存器就是"往某个门牌号塞一个值"。
 
 ### 严格解释（本工程真实地址，来自 `.bd` 的 `addressing` 段）
 本工程的地址映射是 Vivado 在 BD 里自动分配的，解析 `.bd` 可得（`.bd` → `design.addressing`）：
 
 | 目标 | 基地址 | 范围 | 作用 |
 |---|---|---|---|
-| `pd_feature_0` | `0x4000_0000` | 64K | 特征提取 IP 的 AXI-Lite 寄存器（配置/状态/PRPD 图谱） |
-| `pd_ddr_0` | `0x4001_0000` | 64K | DDR 环形缓存/快照管理 IP 的 AXI-Lite 寄存器 |
+| `pd_ddr_0` | `0x4000_0000` | 64K | DDR 环形缓存/快照管理 IP 的 AXI-Lite 寄存器 |
+| `pd_feature_0` | `0x4001_0000` | 64K | 特征提取 IP 的 AXI-Lite 寄存器（配置/状态/PRPD 图谱） |
 | `pd_filter_0` | `0x4002_0000` | 64K | IIR 滤波器 IP 的 AXI-Lite 寄存器（系数/旁路） |
 | `axi_dma_0` | `0x4040_0000` | 64K | AXI DMA（S2MM）寄存器（启动一次 DMA 搬运） |
 | DDR（内存） | `0x0000_0000` | 1G（`range: 1G`） | 大内存，PL 的 DMA 和 CPU 都能读写 |
@@ -103,9 +103,9 @@ PS 把整块芯片（包括 PL 里的寄存器、自己的 DDR、自己的外设
 static u32 ddr_read (u32 off) { return Xil_In32 (PD_DDR_BASE + off); }   // 读
 static void ddr_write(u32 off, u32 value) { Xil_Out32(PD_DDR_BASE + off, value); } // 写
 ```
-其中 `PD_DDR_BASE` 就是 `0x4001_0000`（`pd_hw_map.h:13-19` 从 `xparameters.h` 取 `XPAR_PD_DDR_0_BASEADDR`）。例如"启动采集"就是 `ddr_write(PD_DDR_CTRL, 1U)`（写 `0x4001_0000 + 0x000`），"读状态"就是 `ddr_read(PD_DDR_STATUS)`（读 `0x4001_0004`）。CPU 不需要知道 PL 内部细节，它只认"地址 + 32 位值"。
+其中 `PD_DDR_BASE` 就是 `0x4000_0000`（由当前 `xparameters.h` 的 `XPAR_PD_DDR_0_BASEADDR` 得到）。例如"启动采集"就是 `ddr_write(PD_DDR_CTRL, 1U)`（写 `0x4000_0000 + 0x000`），"读状态"就是 `ddr_read(PD_DDR_STATUS)`（读 `0x4000_0004`）。CPU 不需要知道 PL 内部细节，它只认"地址 + 32 位值"。
 
-> **如果这里搞错，会表现为：** 把 `0x4000_0000` 三家（`pd_feature_0`/`pd_ddr_0`/`pd_filter_0`）的偏移算错或越界，写入会落到别的模块寄存器上，现象是"写 A 模块的配置，B 模块的行为却变了"，极难排查；或者 bit 文件与软件来自不同版本，寄存器布局对不上，读写全是乱码。
+> **如果这里搞错，会表现为：** 把 `0x4000_0000`、`0x4001_0000`、`0x4002_0000` 三个相邻 64K 地址窗里的从机基址/偏移算错或越界，写入会落到别的模块寄存器上，现象是"写 A 模块的配置，B 模块的行为却变了"，极难排查；或者 bit 文件与软件来自不同版本，寄存器布局对不上，读写全是乱码。
 
 ---
 
@@ -266,7 +266,7 @@ if (err != ERR_OK) return -1;
 
 下面这张表把"PS 通过 GP0 访问的每个寄存器、读什么/写什么/什么时机"列清楚。所有偏移都来自 `sw/ps_service/include/pd_hw_map.h`，基地址来自 `.bd` 的 `addressing` 段。
 
-### 9.1 `pd_ddr_0` 基地址 `0x4001_0000`（控制/状态/快照管理）
+### 9.1 `pd_ddr_0` 基地址 `0x4000_0000`（控制/状态/快照管理）
 来源：`pd_hw_map.h:40-67`、`pd_acquisition_core.c` 全程调用。
 
 | 寄存器（宏） | 偏移 | 方向 | PS 读/写什么 | 时机（代码位置） |
@@ -297,14 +297,14 @@ if (err != ERR_OK) return -1;
 
 DMA 的方向是 **PL(事件 AXI-Stream) → DDR(RX 缓冲)**（`c_include_s2mm=1, c_include_mm2s=0`，`.bd` 参数），数据位宽 64 位（`c_m_axi_s2mm_data_width=64`）。CPU 不参与搬运，只负责"下令 + 等完成 + 作废 Cache 后读"。
 
-### 9.3 `pd_feature_0` 基地址 `0x4000_0000` 与 `pd_filter_0` 基地址 `0x4002_0000`
+### 9.3 `pd_feature_0` 基地址 `0x4001_0000` 与 `pd_filter_0` 基地址 `0x4002_0000`
 这两个 IP 也是经 GP0 的 AXI-Lite 从机（`pd_feature_sys_top.v:56` 的 `S_AXI`、`.bd` 里 `axi_ic_ctrl_M00_AXI→axi_rs_feature_ctrl_0→pd_feature_0/s_axi`、`axi_ic_ctrl_M03_AXI→pd_filter_0/S_AXI`）。它们的**详细寄存器偏移**写在各自 RTL 里（`pd_axil_regs.v`、`pd_filter_chain.v`），软件侧本工程主要通过 `pd_feature_0` 的全局控制/状态字与 PRPD 图谱读取来交互；`pd_filter_0` 则通过写系数/旁路位（`pd_filter_chain.v:89-94`：写 `0x0` 控旁路、写 `0x10+` 写系数、读 `0x00C` 可读回 `SAMPLE_HZ`）来配置 IIR 滤波。本工程 `pd_filter_apply.c` 这类脚本即用来装载滤波系数。
 
 ### 9.4 内存区域（PS 与 PL 共享的 DDR 布局，来自 `pd_hw_map.h:78-87`）
 | 区域 | 地址 | 用途 |
 |---|---|---|
 | `PD_RX_BUFFER_BASE` | `PD_PS_DDR_BASE + 0x01000000` | DMA 把事件流写到这里，CPU 读它归档 |
-| `PD_EVENT_ARCHIVE_BASE` | `0x27000000` | 事件归档区（16 份，每份 `0x10000`） |
+| `PD_EVENT_ARCHIVE_BASE` | `0x27000000` | 事件归档区（2048 份，每份 `0x10000`） |
 | `PD_SNAP_ARCHIVE_BASE` | `0x24000000` | 快照归档区（4 份，每份 `0xC00000`） |
 | `PD_SNAP_SLOT_LOW/HIGH` | `0x20001000` / `0x23001000` | PL 硬件四槽快照区（PL 经 HP0 写、CPU 经 HP 读） |
 

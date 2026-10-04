@@ -181,6 +181,20 @@ Config parseConfig(const QString &line)
     if (snapSlotsMatch.hasMatch()) result.snapSlots = toU32(snapSlotsMatch.captured(1));
     const auto eventSlotsMatch = eventSlotsExpr.match(line);
     if (eventSlotsMatch.hasMatch()) result.eventSlots = toU32(eventSlotsMatch.captured(1));
+
+    static const QRegularExpression scaleExpr(
+        QStringLiteral("\\bscale_q88=(\\d+),(\\d+),(\\d+),(\\d+)"));
+    const auto scaleMatch = scaleExpr.match(line);
+    if (scaleMatch.hasMatch()) {
+        bool valid = true;
+        for (int channel = 0; channel < 4; ++channel) {
+            bool ok = false;
+            result.scaleQ88[channel] = scaleMatch.captured(channel + 1).toUInt(&ok);
+            valid = valid && ok && result.scaleQ88[channel] != 0U &&
+                    result.scaleQ88[channel] <= 65535U;
+        }
+        result.hasScaleQ88 = valid;
+    }
     return result;
 }
 

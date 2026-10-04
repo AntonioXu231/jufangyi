@@ -227,16 +227,20 @@ void ScopeStream::setSuspendRequests(bool suspended)
     }
 }
 
-void ScopeStream::requestEventFrame(quint32 eventSequence)
+void ScopeStream::requestEventFrame(quint32 eventSequence, quint32 channel,
+                                    quint32 eventWordSequence)
 {
     if (m_client == nullptr || !m_client->isConnected() ||
         m_state == State::Idle || m_state == State::Fault) {
-        emit eventFrameFailed(eventSequence, QStringLiteral("实时取帧尚未开启或 TCP 未连接。"));
+        emit eventFrameFailed(eventSequence, channel, eventWordSequence,
+                              QStringLiteral("实时取帧尚未开启或 TCP 未连接。"));
         return;
     }
     /* Keep only the newest event: while a PRPD archive record is being decoded,
        a burst of events should not build an unbounded binary-transfer queue. */
     m_pendingEventSequence = eventSequence;
+    m_pendingEventChannel = channel;
+    m_pendingEventWordSequence = eventWordSequence;
     m_eventRequestPending = true;
     requestPendingEventFrame();
 }
@@ -249,10 +253,14 @@ void ScopeStream::requestPendingEventFrame()
         return;
     m_eventFrameInFlight = true;
     m_eventSequenceInFlight = m_pendingEventSequence;
+    m_eventChannelInFlight = m_pendingEventChannel;
+    m_eventWordSequenceInFlight = m_pendingEventWordSequence;
     m_eventRequestPending = false;
     m_paceTimer->stop();
     setFrameInFlight(true);
-    send(QStringLiteral("SCOPE EVENT SEQ %1 %2").arg(m_eventSequenceInFlight).arg(m_samples));
+    send(QStringLiteral("SCOPE EVENT SEQ %1 %2 %3 %4")
+             .arg(m_eventSequenceInFlight).arg(m_samples)
+             .arg(m_eventChannelInFlight).arg(m_eventWordSequenceInFlight));
     m_watchdog->start(m_watchdogMs);
 }
 
@@ -375,13 +383,22 @@ void ScopeStream::handleBoardError(const QString &line)
         if (m_eventFrameInFlight) {
             const quint32 sequence = m_eventSequenceInFlight;
             m_eventFrameInFlight = false;
-            emit eventFrameFailed(sequence, line);
+            emit eventFrameFailed(sequence, m_eventChannelInFlight,
+                                  m_eventWordSequenceInFlight, line);
         }
         m_watchdog->stop();
         if (m_state == State::Streaming) m_paceTimer->start(50);
         return;
     }
     if (line.contains(QStringLiteral("SCOPE is off"))) {
+        if (m_eventFrameInFlight) {
+            const quint32 sequence = m_eventSequenceInFlight;
+            m_eventFrameInFlight = false;
+            setFrameInFlight(false);
+            m_watchdog->stop();
+            emit eventFrameFailed(sequence, m_eventChannelInFlight,
+                                  m_eventWordSequenceInFlight, line);
+        }
         m_scopeEnabledOnBoard = true;
         setState(State::Enabling, QStringLiteral("板端 SCOPE 已关闭，重新开启。"));
         send(QStringLiteral("SCOPE ON %1").arg(m_samples));
@@ -393,7 +410,8 @@ void ScopeStream::handleBoardError(const QString &line)
         if (m_eventFrameInFlight) {
             const quint32 sequence = m_eventSequenceInFlight;
             m_eventFrameInFlight = false;
-            emit eventFrameFailed(sequence, line);
+            emit eventFrameFailed(sequence, m_eventChannelInFlight,
+                                  m_eventWordSequenceInFlight, line);
         }
         m_watchdog->stop();
         if (m_autoStart && !m_stopRequested) {
@@ -410,7 +428,8 @@ void ScopeStream::handleBoardError(const QString &line)
         if (m_eventFrameInFlight) {
             const quint32 sequence = m_eventSequenceInFlight;
             m_eventFrameInFlight = false;
-            emit eventFrameFailed(sequence, line);
+            emit eventFrameFailed(sequence, m_eventChannelInFlight,
+                                  m_eventWordSequenceInFlight, line);
         }
         m_watchdog->stop();
         /* 环尚未就绪通常出现在采集刚开始时，稍后重试。 */
@@ -422,7 +441,8 @@ void ScopeStream::handleBoardError(const QString &line)
         m_eventFrameInFlight = false;
         setFrameInFlight(false);
         m_watchdog->stop();
-        emit eventFrameFailed(sequence, line);
+        emit eventFrameFailed(sequence, m_eventChannelInFlight,
+                              m_eventWordSequenceInFlight, line);
         if (m_state == State::Streaming && !m_suspendRequests) scheduleFrameRequest();
         return;
     }
@@ -432,24 +452,45 @@ void ScopeStream::handleBoardError(const QString &line)
 
 /* ------------------------------------------------------------------ 帧到达 */
 
-void ScopeStream::onScopeFrame(const QByteArray &raw, quint32 samples, quint32 sampleRateHz)
+void ScopeStream::onScopeFrame(const QByteArray &raw, quint32 samples, quint32 sampleRateHz,
+                               quint32 sequence, quint32 eventRecordSequence,
+                               quint32 eventChannel, quint32 eventWordSequence)
 {
     const bool isEventFrame = m_eventFrameInFlight;
     const quint32 eventSequence = m_eventSequenceInFlight;
+    if (isEventFrame &&
+        (eventRecordSequence != m_eventSequenceInFlight ||
+         eventChannel != m_eventChannelInFlight ||
+         eventWordSequence != m_eventWordSequenceInFlight)) {
+        ++m_statistics.protocolErrors;
+        m_watchdog->stop();
+        setFrameInFlight(false);
+        m_eventFrameInFlight = false;
+        emit statisticsChanged();
+        emit eventFrameFailed(eventSequence, m_eventChannelInFlight,
+                              m_eventWordSequenceInFlight,
+                              QStringLiteral("SCOPE V2 事件选择头与请求不一致。"));
+        if (m_state == State::Streaming && !m_suspendRequests) scheduleFrameRequest();
+        return;
+    }
     m_watchdog->stop();
     setFrameInFlight(false);
     m_eventFrameInFlight = false;
     m_consecutiveTimeouts = 0;
 
     pdsample::WaveformFrame frame;
-    if (!pdsample::decodeFrame(raw, static_cast<double>(sampleRateHz), -1, frame) ||
+    if (!pdsample::decodeFrame(raw, static_cast<double>(sampleRateHz),
+                               static_cast<qint64>(sequence), frame) ||
         frame.sampleCount != static_cast<int>(samples)) {
         /* 长度/块对齐不满足 PL 的 24 字节块契约，属于契约不匹配，不能当数据用。 */
         ++m_statistics.protocolErrors;
         emit statisticsChanged();
         emit logLine(QStringLiteral("[scope] 帧长度不符合 24 字节块契约：收到 %1 字节，期望 %2。")
                          .arg(raw.size()).arg(samples * pdsample::kBytesPerSample));
-        if (isEventFrame) emit eventFrameFailed(eventSequence, QStringLiteral("事件波形帧长度无效。"));
+        if (isEventFrame)
+            emit eventFrameFailed(eventSequence, m_eventChannelInFlight,
+                                  m_eventWordSequenceInFlight,
+                                  QStringLiteral("事件波形帧长度无效。"));
         requestPendingEventFrame();
         if (m_state == State::Streaming) scheduleFrameRequest();
         flushPendingScopeOff();
@@ -465,7 +506,8 @@ void ScopeStream::onScopeFrame(const QByteArray &raw, quint32 samples, quint32 s
            for the continuous live stream.  The widget decides how long it is
            visible; the stream can remain suspended while PRPD consumes the
            event archive. */
-        emit eventFrame(frame, eventSequence);
+        emit eventFrame(frame, eventSequence, m_eventChannelInFlight,
+                        m_eventWordSequenceInFlight);
         if (!m_suspendRequests && m_state == State::Streaming)
             scheduleFrameRequest();
         else
@@ -535,7 +577,9 @@ void ScopeStream::onWatchdog()
     if (m_eventFrameInFlight) {
         const quint32 sequence = m_eventSequenceInFlight;
         m_eventFrameInFlight = false;
-        emit eventFrameFailed(sequence, QStringLiteral("事件波形帧超时。"));
+        emit eventFrameFailed(sequence, m_eventChannelInFlight,
+                              m_eventWordSequenceInFlight,
+                              QStringLiteral("事件波形帧超时。"));
     }
     emit statisticsChanged();
     emit logLine(QStringLiteral("[scope] 帧超时（第 %1 次，累计 %2 次）。")
@@ -563,7 +607,8 @@ void ScopeStream::onDownloadFailed(const QString &reason)
     if (m_eventFrameInFlight) {
         const quint32 sequence = m_eventSequenceInFlight;
         m_eventFrameInFlight = false;
-        emit eventFrameFailed(sequence, reason);
+        emit eventFrameFailed(sequence, m_eventChannelInFlight,
+                              m_eventWordSequenceInFlight, reason);
     }
     ++m_statistics.crcErrors;
     emit statisticsChanged();

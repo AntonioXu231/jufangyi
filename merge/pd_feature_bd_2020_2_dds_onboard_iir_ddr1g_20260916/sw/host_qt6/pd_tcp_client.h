@@ -33,7 +33,13 @@ signals:
     void downloadProgress(qint64 received, qint64 total);
     void downloadComplete(const QString &path, quint32 bytes, quint32 crc32, const QString &kind);
     void downloadFailed(const QString &reason);
-    void scopeFrame(const QByteArray &packedSamples, quint32 samples, quint32 sampleRateHz);
+    void scopeFrame(const QByteArray &packedSamples, quint32 samples, quint32 sampleRateHz,
+                    quint32 sequence, quint32 eventRecordSequence,
+                    quint32 eventChannel, quint32 eventWordSequence);
+    void scopeSpectrumFrame(const QByteArray &magnitudesLe, quint32 sequence,
+                            quint32 channel, quint32 sampleRateHz,
+                            quint32 peakBin, quint32 peakHz,
+                            quint32 amplitudeCode, quint32 dcCode);
 
 private slots:
     void onReadyRead();
@@ -45,6 +51,7 @@ private:
     void processTextLines();
     void processBinary();
     void beginNextWholeChunk();
+    void beginNextEventChunk();
     void resetDownload();
     static quint32 crc32(const QByteArray &bytes);
 
@@ -57,8 +64,23 @@ private:
     quint32 m_expectedCrc = 0;
     quint32 m_scopeSamples = 0;
     quint32 m_scopeSampleRateHz = 0;
+    quint32 m_scopeSequence = 0;
+    quint32 m_scopeEventRecordSequence = 0;
+    quint32 m_scopeEventChannel = 0xFFFFFFFFU;
+    quint32 m_scopeEventWordSequence = 0;
+    quint32 m_scopeFftSequence = 0;
+    quint32 m_scopeFftChannel = 0;
+    quint32 m_scopeFftSampleRateHz = 0;
+    quint32 m_scopeFftPeakBin = 0;
+    quint32 m_scopeFftPeakHz = 0;
+    quint32 m_scopeFftAmplitudeCode = 0;
+    quint32 m_scopeFftDcCode = 0;
     QByteArray m_download;
     bool m_wholeSnapshot = false;
+    bool m_wholeEventRecord = false;
+    quint32 m_wholeEventSequence = 0;
+    quint32 m_wholeEventBytes = 0;
+    quint32 m_wholeEventOffset = 0;
     bool m_wholeSnapshotBySequence = false;
     quint32 m_wholeSnapshotSequence = 0;
     quint32 m_wholeSnapshotIndex = 0;

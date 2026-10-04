@@ -51,7 +51,7 @@ AXIS 特征包  → RX 缓冲(0x01100000) → 事件归档环(16 × 64 KiB)
 #elif defined(XPAR_PD_DDR_BD_ADAPTER_0_BASEADDR)
 ...
 ```
-- `pd_ddr_0` 的 AXI-Lite 基址（实测 `0x4001_0000`）。两种宏名对应两代 BSP 风格。
+- 当前 BD/用户提供的 Vitis `xparameters.h` 中 `pd_ddr_0` AXI-Lite 基址为 `0x4000_0000`；本文原始测量来自旧映射快照。两种宏名对应两代 BSP 风格，运行前以活动平台生成头文件为准。
 
 ```c
 #if defined(XPAR_XAXIDMA_0_BASEADDR)

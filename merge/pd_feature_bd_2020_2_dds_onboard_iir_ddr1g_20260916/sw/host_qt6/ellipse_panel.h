@@ -59,6 +59,8 @@ public:
     void setEvents(const QVector<pdsample::PeakEvent> &events);
     void appendEvents(const QVector<pdsample::PeakEvent> &events);
     void clear();
+    void setAgingSeconds(double seconds);
+    double agingSeconds() const { return m_agingSeconds; }
     int eventCount() const { return m_count; }
     double peakAdcCodes() const { return m_peakCodes; }
     int confirmedCount() const { return m_confirmedIndices.size(); }
@@ -137,8 +139,9 @@ private:
     QVector<qint64> m_times;
     int m_head = 0;
     int m_count = 0;
-    double m_agingSeconds = 10.0;
-    int m_maximumEvents = 60000;
+    double m_agingSeconds = 15.0;
+    /* 15 s 窗口的安全上限；超出时 prune 仍会做容量兜底。 */
+    int m_maximumEvents = 1000000;
 
     /* 缓存 */
     double m_peakCodes = 0.0;
