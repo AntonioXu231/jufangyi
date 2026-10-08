@@ -311,6 +311,100 @@ void PdTcpClient::processTextLines()
             emit textLine(line);
             return;
         }
+        if (line.startsWith(QStringLiteral("FFT_SNAP_BINS_V1 "))) {
+            const auto parseField = [&line](const QString &name, quint32 &value) {
+                const QRegularExpression expression(
+                    QStringLiteral("\\b%1=(\\d+)").arg(QRegularExpression::escape(name)));
+                const auto match = expression.match(line);
+                if (!match.hasMatch()) return false;
+                bool ok = false;
+                value = match.captured(1).toUInt(&ok);
+                return ok;
+            };
+            const QRegularExpression crcExpr(QStringLiteral("\\bcrc32=([0-9a-fA-F]{8})"));
+            const auto crcMatch = crcExpr.match(line);
+            quint32 snapshotSamples = 0U, samples = 0U, points = 0U, binHz = 0U, bytes = 0U;
+            if (!parseField(QStringLiteral("seq"), m_snapshotFftSequence) ||
+                !parseField(QStringLiteral("index"), m_snapshotFftIndex) ||
+                !parseField(QStringLiteral("channel"), m_snapshotFftChannel) ||
+                !parseField(QStringLiteral("start"), m_snapshotFftStartSample) ||
+                !parseField(QStringLiteral("snap_samples"), snapshotSamples) ||
+                !parseField(QStringLiteral("samples"), samples) ||
+                !parseField(QStringLiteral("points"), points) ||
+                !parseField(QStringLiteral("fs"), m_snapshotFftSampleRateHz) ||
+                !parseField(QStringLiteral("bin_hz"), binHz) ||
+                !parseField(QStringLiteral("peak_bin"), m_snapshotFftPeakBin) ||
+                !parseField(QStringLiteral("peak_hz"), m_snapshotFftPeakHz) ||
+                !parseField(QStringLiteral("amplitude"), m_snapshotFftAmplitudeCode) ||
+                !parseField(QStringLiteral("dc"), m_snapshotFftDcCode) ||
+                !parseField(QStringLiteral("bytes"), bytes) || !crcMatch.hasMatch()) {
+                emit downloadFailed(QStringLiteral("FFT_SNAP_BINS 帧头格式错误：%1").arg(line));
+                resetDownload();
+                return;
+            }
+            m_expectedBytes = bytes;
+            m_expectedCrc = crcMatch.captured(1).toUInt(nullptr, 16);
+            if (m_snapshotFftIndex >= 4U || m_snapshotFftChannel >= 4U ||
+                samples != 1024U || points != 1024U || binHz == 0U ||
+                m_snapshotFftSampleRateHz == 0U || m_snapshotFftPeakBin > 512U ||
+                m_snapshotFftStartSample > snapshotSamples ||
+                1024U > snapshotSamples - m_snapshotFftStartSample ||
+                m_expectedBytes != 513U * 2U) {
+                emit downloadFailed(QStringLiteral("FFT_SNAP_BINS 参数无效：%1").arg(line));
+                resetDownload();
+                return;
+            }
+            m_snapshotFftSnapshotSamples = snapshotSamples;
+            m_expectedKind = QStringLiteral("FFT_SNAP_BINS");
+            m_mode = ReceiveMode::Binary;
+            emit textLine(line);
+            return;
+        }
+        if (line.startsWith(QStringLiteral("SCOPE_ENV V1 "))) {
+            const auto parseField = [&line](const QString &name, quint32 &value) {
+                const QRegularExpression expression(
+                    QStringLiteral("\\b%1=(\\d+)").arg(QRegularExpression::escape(name)));
+                const auto match = expression.match(line);
+                if (!match.hasMatch()) return false;
+                bool ok = false;
+                value = match.captured(1).toUInt(&ok);
+                return ok;
+            };
+            const QRegularExpression lockExpr(QStringLiteral("\\block=([0-9a-fA-F]+)"));
+            const QRegularExpression phaseExpr(QStringLiteral("\\bphase=([A-Za-z0-9_]+)"));
+            const QRegularExpression crcExpr(QStringLiteral("\\bcrc32=([0-9a-fA-F]{8})"));
+            const auto lockMatch = lockExpr.match(line);
+            const auto phaseMatch = phaseExpr.match(line);
+            const auto crcMatch = crcExpr.match(line);
+            quint32 bytes = 0U;
+            if (!parseField(QStringLiteral("seq"), m_scopeEnvSequence) ||
+                !parseField(QStringLiteral("snap_seq"), m_scopeEnvSnapshotSequence) ||
+                !parseField(QStringLiteral("samples"), m_scopeEnvSamples) ||
+                !parseField(QStringLiteral("bins"), m_scopeEnvBins) ||
+                !parseField(QStringLiteral("bytes"), bytes) ||
+                !parseField(QStringLiteral("fs"), m_scopeEnvSampleRateHz) ||
+                !lockMatch.hasMatch() || !phaseMatch.hasMatch() || !crcMatch.hasMatch()) {
+                emit downloadFailed(QStringLiteral("SCOPE_ENV 帧头格式错误：%1").arg(line));
+                resetDownload();
+                return;
+            }
+            bool lockOk = false;
+            m_scopeEnvLockMask = lockMatch.captured(1).toUInt(&lockOk, 16);
+            m_expectedBytes = bytes;
+            m_expectedCrc = crcMatch.captured(1).toUInt(nullptr, 16);
+            if (!lockOk || phaseMatch.captured(1) != QStringLiteral("cycle_start") ||
+                m_scopeEnvSamples != 520000U || m_scopeEnvBins != 1024U ||
+                m_expectedBytes != 16384U || m_scopeEnvSampleRateHz == 0U ||
+                (m_scopeEnvLockMask & ~0xFU) != 0U) {
+                emit downloadFailed(QStringLiteral("SCOPE_ENV 参数无效：%1").arg(line));
+                resetDownload();
+                return;
+            }
+            m_expectedKind = QStringLiteral("SCOPE_ENV");
+            m_mode = ReceiveMode::Binary;
+            emit textLine(line);
+            return;
+        }
         emit textLine(line);
     }
 }
@@ -365,6 +459,40 @@ void PdTcpClient::processBinary()
         resetDownload();
         emit scopeSpectrumFrame(bins, sequence, channel, sampleRateHz,
                                 peakBin, peakHz, amplitudeCode, dcCode);
+        if (!m_rx.isEmpty()) processTextLines();
+        return;
+    }
+    if (m_expectedKind == QStringLiteral("FFT_SNAP_BINS")) {
+        const QByteArray bins = m_download;
+        const quint32 sequence = m_snapshotFftSequence;
+        const quint32 index = m_snapshotFftIndex;
+        const quint32 channel = m_snapshotFftChannel;
+        const quint32 startSample = m_snapshotFftStartSample;
+        const quint32 snapshotSamples = m_snapshotFftSnapshotSamples;
+        const quint32 sampleRateHz = m_snapshotFftSampleRateHz;
+        const quint32 peakBin = m_snapshotFftPeakBin;
+        const quint32 peakHz = m_snapshotFftPeakHz;
+        const quint32 amplitudeCode = m_snapshotFftAmplitudeCode;
+        const quint32 dcCode = m_snapshotFftDcCode;
+        resetDownload();
+        emit snapshotSpectrumFrame(bins, sequence, index, channel, startSample,
+                                   snapshotSamples,
+                                   sampleRateHz, peakBin, peakHz,
+                                   amplitudeCode, dcCode);
+        if (!m_rx.isEmpty()) processTextLines();
+        return;
+    }
+    if (m_expectedKind == QStringLiteral("SCOPE_ENV")) {
+        const QByteArray payload = m_download;
+        const quint32 sequence = m_scopeEnvSequence;
+        const quint32 snapshotSequence = m_scopeEnvSnapshotSequence;
+        const quint32 samples = m_scopeEnvSamples;
+        const quint32 bins = m_scopeEnvBins;
+        const quint32 sampleRateHz = m_scopeEnvSampleRateHz;
+        const quint32 lockMask = m_scopeEnvLockMask;
+        resetDownload();
+        emit scopeEnvelopeFrame(payload, sequence, snapshotSequence,
+                                samples, bins, sampleRateHz, lockMask);
         if (!m_rx.isEmpty()) processTextLines();
         return;
     }

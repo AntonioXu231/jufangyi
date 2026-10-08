@@ -323,6 +323,11 @@ MainWindow::MainWindow()
     m_ringAging->setToolTip(QStringLiteral("环上只保留最近这段时间内的脉冲，形成持续刷新的效果。"));
     auto *refreshRing = new QPushButton(QStringLiteral("立即刷新一次"), ringBox);
     connect(refreshRing, &QPushButton::clicked, this, &MainWindow::startPrpdRound);
+    m_scopeEnvelopeButton = new QPushButton(QStringLiteral("PS 包络"), ringBox);
+    m_scopeEnvelopeButton->setToolTip(QStringLiteral(
+        "请求最新完整 50 Hz 快照的 1024 列 min/max 包络。此包络是压缩预览，不替代原始 520,000 点 SNAP。"));
+    connect(m_scopeEnvelopeButton, &QPushButton::clicked,
+            this, &MainWindow::requestScopeEnvelope);
 
     m_grabSnapshotButton = new QPushButton(QStringLiteral("暂停并抓取快照"), ringBox);
     m_grabSnapshotButton->setToolTip(QStringLiteral(
@@ -338,6 +343,7 @@ MainWindow::MainWindow()
     ringBar->addWidget(new QLabel(QStringLiteral("环老化"), ringBox));
     ringBar->addWidget(m_ringAging);
     ringBar->addWidget(refreshRing);
+    ringBar->addWidget(m_scopeEnvelopeButton);
     ringBar->addSpacing(24);
     ringBar->addWidget(m_grabSnapshotButton);
     ringBar->addWidget(m_resumeButton);
@@ -534,9 +540,22 @@ MainWindow::MainWindow()
     m_fftChannelSelector = new QComboBox(singleChannelPage);
     m_fftChannelSelector->addItems({QStringLiteral("通道 0"), QStringLiteral("通道 1"),
                                     QStringLiteral("通道 2"), QStringLiteral("通道 3")});
+    m_snapshotFftStartSample = makeSpin(singleChannelPage, 0, 518976, 0, 1024);
+    m_snapshotFftStartSample->setSuffix(QStringLiteral(" sample"));
+    m_snapshotFftStartSample->setToolTip(QStringLiteral(
+        "选择归档 520,000 点快照内 1024 点 PS FFT 窗口起点。仅在板端 IDLE 且已载入有序号的完整快照时可用。"));
+    m_snapshotFftButton = new QPushButton(QStringLiteral("PS FFT 归档快照"), singleChannelPage);
+    m_snapshotFftButton->setEnabled(false);
+    m_snapshotFftButton->setToolTip(QStringLiteral(
+        "要求 PS 已处于 IDLE。计算所选通道、所选采样窗口的 1024 点频谱；FFT 在 PS 执行，Qt 只绘图。"));
+    connect(m_snapshotFftButton, &QPushButton::clicked,
+            this, &MainWindow::requestSnapshotSpectrum);
     m_fftStatus = new QLabel(QStringLiteral("等待板端 SCOPE 帧与 PS FFT"), singleChannelPage);
     singleChannelBar->addWidget(new QLabel(QStringLiteral("FFT 通道"), singleChannelPage));
     singleChannelBar->addWidget(m_fftChannelSelector);
+    singleChannelBar->addWidget(new QLabel(QStringLiteral("SNAP FFT 起点"), singleChannelPage));
+    singleChannelBar->addWidget(m_snapshotFftStartSample);
+    singleChannelBar->addWidget(m_snapshotFftButton);
     singleChannelBar->addWidget(m_fftStatus, 1);
     singleChannelLayout->addLayout(singleChannelBar);
     auto *singleChannelSplitter = new QSplitter(Qt::Vertical, singleChannelPage);
@@ -566,6 +585,15 @@ MainWindow::MainWindow()
             (void)refreshSpectrumFor(m_lastScopeFrame);
         }
     });
+
+    /* ===== 页签 3b：PS 整周期 min/max 包络（压缩预览） ===== */
+    auto *envelopePage = new QWidget(tabs);
+    auto *envelopeLayout = new QVBoxLayout(envelopePage);
+    m_scopeEnvelopeStatus = new QLabel(QStringLiteral("等待读取完整快照包络"), envelopePage);
+    envelopeLayout->addWidget(m_scopeEnvelopeStatus);
+    m_scopeEnvelopePlot = new PlotWidget(envelopePage);
+    envelopeLayout->addWidget(m_scopeEnvelopePlot, 1);
+    tabs->addTab(envelopePage, QStringLiteral("整周期包络（PS min/max）"));
 
     /* ===== 页签 4：PRPD 相位直方图 ===== */
     auto *histPage = new QWidget(tabs);
@@ -642,6 +670,10 @@ MainWindow::MainWindow()
     connect(m_downloadButton, &QPushButton::clicked, this, &MainWindow::requestDownload);
     m_wholeSnapshotButton = new QPushButton(QStringLiteral("下载完整 SNAP（指定槽）"), downloadBox);
     connect(m_wholeSnapshotButton, &QPushButton::clicked, this, [this] {
+        if (m_snapshotFftInFlight || m_scopeEnvelopeInFlight || m_scopeEnvelopeRequestPending) {
+            appendLog(QStringLiteral("ERR"), QStringLiteral("PS FFT/包络传输中，请稍后下载 SNAP。"));
+            return;
+        }
         /* 槽下标模式的整份下载同样要走 GET SNAP，板端要求 IDLE。 */
         if (scopeIsActive()) {
             appendLog(QStringLiteral("ERR"),
@@ -758,6 +790,7 @@ MainWindow::MainWindow()
     connect(m_snapshotTimer, &QTimer::timeout, this, &MainWindow::pumpSnapshotGrab);
 
     connect(&m_client, &PdTcpClient::connected, this, [this] {
+        m_lastBoardState = -1;
         updateConnectionUi(true);
         m_prpdRoundTimer->start();
         startPrpdRound();
@@ -774,6 +807,11 @@ MainWindow::MainWindow()
     connect(&m_client, &PdTcpClient::disconnected, this, [this] {
         if (m_scopeFftInFlight)
             finishPsSpectrumRequest(QStringLiteral("TCP 断开，PS FFT 请求取消。"));
+        if (m_snapshotFftInFlight)
+            finishSnapshotSpectrumRequest(QStringLiteral("TCP 断开，归档快照 FFT 请求取消。"));
+        if (m_scopeEnvelopeInFlight || m_scopeEnvelopeRequestPending)
+            finishScopeEnvelopeRequest(QStringLiteral("TCP 断开，整周期包络请求取消。"));
+        m_lastBoardState = -1;
         if (m_prpdRound != PrpdRound::Idle) finishPrpdRound();
         m_prpdRoundTimer->stop();
         m_snapshotTimer->stop();
@@ -785,6 +823,9 @@ MainWindow::MainWindow()
             [this](const QString &e) {
         appendLog(QStringLiteral("ERR"), e);
         if (m_scopeFftInFlight) finishPsSpectrumRequest(e);
+        if (m_snapshotFftInFlight) finishSnapshotSpectrumRequest(e);
+        if (m_scopeEnvelopeInFlight || m_scopeEnvelopeRequestPending)
+            finishScopeEnvelopeRequest(e);
     });
     connect(&m_client, &PdTcpClient::scopeSpectrumFrame, this,
             [this](const QByteArray &magnitudesLe, quint32 sequence, quint32 channel,
@@ -820,6 +861,89 @@ MainWindow::MainWindow()
                                  .arg(sequence).arg(channel).arg(sampleRateHz / 1024U));
         Q_UNUSED(peakBin);
         finishPsSpectrumRequest();
+    });
+    connect(&m_client, &PdTcpClient::snapshotSpectrumFrame, this,
+            [this](const QByteArray &magnitudesLe, quint32 sequence, quint32 index,
+                   quint32 channel, quint32 startSample, quint32 snapshotSamples,
+                   quint32 sampleRateHz, quint32 peakBin, quint32 peakHz,
+                   quint32 amplitudeCode, quint32 dcCode) {
+        if (!m_snapshotFftInFlight) return;
+        if (sequence != m_snapshotFftExpectedSequence ||
+            index != sequence % 4U || snapshotSamples != static_cast<quint32>(m_staticSnapshotSamples) ||
+            channel != m_snapshotFftExpectedChannel ||
+            startSample != m_snapshotFftExpectedStart ||
+            magnitudesLe.size() != 513 * 2) {
+            finishSnapshotSpectrumRequest(QStringLiteral(
+                "归档 FFT 帧不匹配：期望 SNAP=%1/CH%2/start=%3，收到 SNAP=%4/CH%5/start=%6/bytes=%7。")
+                .arg(m_snapshotFftExpectedSequence).arg(m_snapshotFftExpectedChannel)
+                .arg(m_snapshotFftExpectedStart).arg(sequence).arg(channel)
+                .arg(startSample).arg(magnitudesLe.size()));
+            return;
+        }
+        QVector<QPointF> curve;
+        curve.reserve(513);
+        const auto *bytes = reinterpret_cast<const uchar *>(magnitudesLe.constData());
+        for (int bin = 0; bin <= 512; ++bin) {
+            const quint16 amplitude = qFromLittleEndian<quint16>(bytes + bin * 2);
+            const double db = amplitude == 0U ? -120.0 : 20.0 * std::log10(amplitude);
+            const double hz = static_cast<double>(bin) * sampleRateHz / 1024.0;
+            curve.append(QPointF(hz, db));
+        }
+        QVector<QVector<QPointF>> curves;
+        curves.append(curve);
+        m_spectrumPlot->setLines(curves, QStringList{QStringLiteral("CH%1 SNAP (PS)").arg(channel)},
+            QStringLiteral("PS 端归档快照 FFT · SNAP seq=%1/槽%2 · start=%3/%4 · 主峰 %5 Hz · %6 码 · DC %7")
+                .arg(sequence).arg(index).arg(startSample).arg(snapshotSamples)
+                .arg(peakHz).arg(amplitudeCode).arg(dcCode),
+            QStringLiteral("频率 Hz"), QStringLiteral("幅值 dB（相对 1 ADC 码）"));
+        m_fftStatus->setText(QStringLiteral("PS 快照 FFT：seq=%1，CH%2，起点 %3，1024 点，Δf=%4 Hz")
+                                 .arg(sequence).arg(channel).arg(startSample)
+                                 .arg(sampleRateHz / 1024U));
+        finishSnapshotSpectrumRequest();
+        Q_UNUSED(peakBin);
+    });
+    connect(&m_client, &PdTcpClient::scopeEnvelopeFrame, this,
+            [this](const QByteArray &payload, quint32 sequence, quint32 snapshotSequence,
+                   quint32 samples, quint32 bins, quint32 sampleRateHz, quint32 lockMask) {
+        if (!m_scopeEnvelopeInFlight) return;
+        if (payload.size() != 1024 * 4 * 4 || samples != 520000U || bins != 1024U ||
+            sampleRateHz != 26000000U || (lockMask & ~0xFU) != 0U) {
+            finishScopeEnvelopeRequest(QStringLiteral(
+                "包络元数据无效：bytes=%1 samples=%2 bins=%3 fs=%4 lock=0x%5")
+                .arg(payload.size()).arg(samples).arg(bins).arg(sampleRateHz)
+                .arg(lockMask, 0, 16));
+            return;
+        }
+
+        QVector<QVector<QPointF>> curves(8);
+        QStringList names;
+        for (int channel = 0; channel < pdsample::kChannelCount; ++channel) {
+            curves[channel * 2].reserve(static_cast<int>(bins));
+            curves[channel * 2 + 1].reserve(static_cast<int>(bins));
+            names.append(QStringLiteral("CH%1 min").arg(channel));
+            names.append(QStringLiteral("CH%1 max").arg(channel));
+        }
+        const auto *bytes = reinterpret_cast<const uchar *>(payload.constData());
+        for (quint32 bin = 0U; bin < bins; ++bin) {
+            const double phase = (static_cast<double>(bin) + 0.5) * 360.0 / bins;
+            for (quint32 channel = 0U; channel < pdsample::kChannelCount; ++channel) {
+                const int offset = static_cast<int>((bin * pdsample::kChannelCount + channel) * 4U);
+                const qint16 minimum = qFromLittleEndian<qint16>(bytes + offset);
+                const qint16 maximum = qFromLittleEndian<qint16>(bytes + offset + 2);
+                curves[channel * 2].append(QPointF(phase, minimum));
+                curves[channel * 2 + 1].append(QPointF(phase, maximum));
+            }
+        }
+        m_scopeEnvelopePlot->setLines(
+            curves, names,
+            QStringLiteral("PS 整周期 min/max 包络 · seq=%1 · SNAP=%2 · lock=0x%3 · 压缩预览")
+                .arg(sequence).arg(snapshotSequence).arg(lockMask, 0, 16),
+            QStringLiteral("相位 °"), QStringLiteral("ADC 相对中点码"));
+        m_scopeEnvelopeStatus->setText(
+            QStringLiteral("%1 点原始快照 → %2 相位列 · fs=%3 MSPS · lock=0x%4（只把锁定位=1的通道当作相位有效）· 完整原始点请下载 SNAP")
+                .arg(samples).arg(bins).arg(sampleRateHz / 1000000U)
+                .arg(lockMask, 0, 16));
+        finishScopeEnvelopeRequest();
     });
     connect(&m_client, &PdTcpClient::downloadProgress, this, [this](qint64 now, qint64 all) {
         m_downloadProgress->setValue(all == 0 ? 0 : static_cast<int>(now * 100 / all));
@@ -872,6 +996,9 @@ MainWindow::MainWindow()
                           .arg(m_eventDownloadSequence));
             finishPrpdRound();
         }
+        if (m_snapshotFftInFlight) finishSnapshotSpectrumRequest(why);
+        if (m_scopeEnvelopeInFlight || m_scopeEnvelopeRequestPending)
+            finishScopeEnvelopeRequest(why);
         if (m_snapshotStage != SnapshotStage::Idle) abortSnapshotGrab(why);
     });
 
@@ -998,7 +1125,10 @@ MainWindow::MainWindow()
         /* 消息本身已带 "[scope] " 前缀，这里不再加前缀，避免出现 [scope] [scope]。 */
         enqueueLog(QString(), line);
     });
-    connect(m_stream, &ScopeStream::inFlightChanged, this, [this](bool) { pumpPrpdRound(); });
+    connect(m_stream, &ScopeStream::inFlightChanged, this, [this](bool inFlight) {
+        if (!inFlight && m_scopeEnvelopeRequestPending) beginScopeEnvelopeTransfer();
+        pumpPrpdRound();
+    });
     connect(m_stream, &ScopeStream::stateChanged, this,
             [this](ScopeStream::State state, const QString &message) {
         m_scopeState->setText(QStringLiteral("状态：%1").arg(describeState(state)));
@@ -1095,12 +1225,20 @@ void MainWindow::send(const QString &command)
 {
     const QString trimmed = command.trimmed();
     if (trimmed.isEmpty()) return;
+    if (m_scopeEnvelopeInFlight || m_scopeEnvelopeRequestPending) {
+        appendLog(QStringLiteral("ERR"), QStringLiteral("PS 整周期包络传输中，命令暂缓：%1").arg(trimmed));
+        return;
+    }
     appendLog(QStringLiteral(">>"), trimmed);
     m_client.sendCommand(trimmed);
 }
 
 void MainWindow::sendManualCommand()
 {
+    if (m_snapshotFftInFlight) {
+        appendLog(QStringLiteral("ERR"), QStringLiteral("PS 快照 FFT 二进制传输中，请稍后发送命令。"));
+        return;
+    }
     send(m_command->text());
     m_command->clear();
 }
@@ -1108,6 +1246,11 @@ void MainWindow::sendManualCommand()
 void MainWindow::connectOrDisconnect()
 {
     if (m_client.isConnected()) {
+        if (m_scopeFftInFlight || m_snapshotFftInFlight ||
+            m_scopeEnvelopeInFlight || m_scopeEnvelopeRequestPending) {
+            appendLog(QStringLiteral("ERR"), QStringLiteral("PS 二进制传输/计算中，等待完成后再断开，避免截断帧。"));
+            return;
+        }
         m_stream->stop();
         m_client.disconnectFromBoard();
         return;
@@ -1127,6 +1270,10 @@ void MainWindow::updateConnectionUi(bool connected)
 
 void MainWindow::startAcquisition()
 {
+    if (m_snapshotFftInFlight || m_scopeEnvelopeInFlight || m_scopeEnvelopeRequestPending) {
+        appendLog(QStringLiteral("ERR"), QStringLiteral("PS FFT/包络传输中，暂不能启动采集。"));
+        return;
+    }
     send(QStringLiteral("START %1").arg(m_packetCount->value()));
 }
 
@@ -1182,6 +1329,10 @@ void MainWindow::applyRingSettings()
 
 void MainWindow::toggleScope()
 {
+    if (m_snapshotFftInFlight || m_scopeEnvelopeInFlight || m_scopeEnvelopeRequestPending) {
+        appendLog(QStringLiteral("ERR"), QStringLiteral("PS FFT/包络传输中，请稍后操作示波器。"));
+        return;
+    }
     if (m_stream->isRunning()) {
         m_stream->stop();
         return;
@@ -1194,11 +1345,19 @@ void MainWindow::toggleScope()
 
 void MainWindow::scopePause()
 {
+    if (m_snapshotFftInFlight || m_scopeEnvelopeInFlight || m_scopeEnvelopeRequestPending) {
+        appendLog(QStringLiteral("ERR"), QStringLiteral("PS FFT/包络传输中，请稍后暂停。"));
+        return;
+    }
     m_stream->pause();
 }
 
 void MainWindow::scopeSingleShot()
 {
+    if (m_snapshotFftInFlight || m_scopeEnvelopeInFlight || m_scopeEnvelopeRequestPending) {
+        appendLog(QStringLiteral("ERR"), QStringLiteral("PS FFT/包络传输中，请稍后取帧。"));
+        return;
+    }
     applyScopeSettings();
     m_liveFftCounter = 0;
     m_stream->singleShot();
@@ -1303,6 +1462,8 @@ void MainWindow::startPrpdRound()
     if (m_prpdRound != PrpdRound::Idle) return;
     if (!m_client.isConnected()) return;
     if (m_scopeFftInFlight) return;
+    if (m_snapshotFftInFlight) return;
+    if (m_scopeEnvelopeInFlight || m_scopeEnvelopeRequestPending) return;
     if (m_snapshotStage != SnapshotStage::Idle) return; /* 暂停编排期间不抢链路 */
     /* 归档冻结退避：没有新事件时继续按间隔发 CATALOG 只是白刷链路与日志。 */
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
@@ -1401,6 +1562,10 @@ void MainWindow::grabSnapshot()
         appendLog(QStringLiteral("ERR"), QStringLiteral("未连接板端。"));
         return;
     }
+    if (m_snapshotFftInFlight || m_scopeEnvelopeInFlight || m_scopeEnvelopeRequestPending) {
+        appendLog(QStringLiteral("ERR"), QStringLiteral("PS FFT/包络传输中，请稍后抓取新快照。"));
+        return;
+    }
     if (m_snapshotStage != SnapshotStage::Idle) return;
     if (m_scopeFftInFlight) {
         appendLog(QStringLiteral("ERR"), QStringLiteral("正在接收 PS FFT 结果，请稍后再抓取快照。"));
@@ -1485,6 +1650,10 @@ void MainWindow::abortSnapshotGrab(const QString &reason)
 
 void MainWindow::resumeAfterSnapshot()
 {
+    if (m_snapshotFftInFlight || m_scopeEnvelopeInFlight || m_scopeEnvelopeRequestPending) {
+        appendLog(QStringLiteral("ERR"), QStringLiteral("PS FFT/包络传输中，请稍后恢复取帧。"));
+        return;
+    }
     if (!m_client.isConnected()) {
         appendLog(QStringLiteral("ERR"), QStringLiteral("未连接板端。"));
         return;
@@ -1508,6 +1677,10 @@ void MainWindow::handleLine(const QString &line)
         finishPsSpectrumRequest(line);
         return;
     }
+    if (m_snapshotFftInFlight && line.startsWith(QStringLiteral("ERR "))) {
+        finishSnapshotSpectrumRequest(line);
+        return;
+    }
     /* SCOPE 帧头每帧一条，进日志会把有用信息刷掉；只更新状态栏。 */
     if (line.startsWith(QStringLiteral("SCOPE V1 "))) {
         statusBar()->showMessage(QStringLiteral("实时取帧：%1").arg(line));
@@ -1520,6 +1693,12 @@ void MainWindow::handleLine(const QString &line)
     } else {
         appendLog(QStringLiteral("<<"), line);
     }
+
+    const pdreply::StatusInfo currentStatus = pdreply::parseStatus(line);
+    if (currentStatus.ok) m_lastBoardState = currentStatus.state;
+    else if (line.startsWith(QStringLiteral("OK start accepted"))) m_lastBoardState = 1;
+    else if (line.startsWith(QStringLiteral("OK stop requested"))) m_lastBoardState = 2;
+    else if (line.startsWith(QStringLiteral("ACQ_CLEAN_STOP"))) m_lastBoardState = 0;
 
     if (line.startsWith(QStringLiteral("CONFIG "))) {
         const pdreply::Config config = pdreply::parseConfig(line);
@@ -1545,6 +1724,14 @@ void MainWindow::handleLine(const QString &line)
             appendLog(QStringLiteral("WARN"),
                       QStringLiteral("板端 CONFIG 未提供有效 scale_q88，沿用手动/默认值。"));
         }
+    }
+
+    if ((m_scopeEnvelopeInFlight || m_scopeEnvelopeRequestPending) &&
+        (line.startsWith(QStringLiteral("SCOPE_ENV NONE")) ||
+         line.startsWith(QStringLiteral("SCOPE_ENV SKIP")) ||
+         line.startsWith(QStringLiteral("ERR ")))) {
+        finishScopeEnvelopeRequest(line);
+        return;
     }
 
     /* ---- 抓快照编排：等 IDLE ---- */
@@ -1743,10 +1930,125 @@ void MainWindow::handleLine(const QString &line)
         statusBar()->showMessage(line);
 }
 
+void MainWindow::requestSnapshotSpectrum()
+{
+    if (!m_client.isConnected()) {
+        appendLog(QStringLiteral("ERR"), QStringLiteral("未连接板端，无法请求 PS 快照 FFT。"));
+        return;
+    }
+    if (!m_staticSnapshotReady || m_staticSnapshotSequence == 0xFFFFFFFFU) {
+        appendLog(QStringLiteral("ERR"),
+                  QStringLiteral("尚未载入带有效归档序号的完整快照；请先暂停采集并抓取快照。"));
+        return;
+    }
+    if (m_lastBoardState != 0) {
+        appendLog(QStringLiteral("ERR"),
+                  QStringLiteral("PS 快照 FFT 要求板端 IDLE。当前状态=%1；先停止采集并确认 STATUS state=0。")
+                      .arg(m_lastBoardState));
+        return;
+    }
+    if (m_snapshotStage != SnapshotStage::Idle || m_prpdRound != PrpdRound::Idle ||
+        m_scopeFftInFlight || m_snapshotFftInFlight || m_scopeEnvelopeInFlight ||
+        m_scopeEnvelopeRequestPending || m_eventDownloadInFlight) {
+        appendLog(QStringLiteral("ERR"), QStringLiteral("TCP 当前有采集/下载编排在途，请稍后再请求快照 FFT。"));
+        return;
+    }
+
+    const quint32 startSample = static_cast<quint32>(m_snapshotFftStartSample->value());
+    if (startSample > static_cast<quint32>(m_staticSnapshotSamples - 1024)) {
+        appendLog(QStringLiteral("ERR"), QStringLiteral("FFT 起点超出当前快照范围。"));
+        return;
+    }
+    m_snapshotFftExpectedSequence = m_staticSnapshotSequence;
+    m_snapshotFftExpectedChannel = static_cast<quint32>(m_fftChannelSelector->currentIndex());
+    m_snapshotFftExpectedStart = startSample;
+    m_snapshotFftInFlight = true;
+    m_fftStatus->setText(QStringLiteral("请求 PS 快照 FFT：seq=%1，CH%2，start=%3…")
+                             .arg(m_snapshotFftExpectedSequence)
+                             .arg(m_snapshotFftExpectedChannel).arg(startSample));
+    m_client.sendCommand(QStringLiteral("FFT BINS SNAP SEQ %1 CHANNEL %2 START %3")
+                             .arg(m_snapshotFftExpectedSequence)
+                             .arg(m_snapshotFftExpectedChannel).arg(startSample));
+}
+
+void MainWindow::finishSnapshotSpectrumRequest(const QString &error)
+{
+    if (!m_snapshotFftInFlight) return;
+    m_snapshotFftInFlight = false;
+    if (!error.isEmpty()) {
+        m_fftStatus->setText(QStringLiteral("PS 快照 FFT 失败：%1").arg(error));
+        appendLog(QStringLiteral("ERR"), QStringLiteral("PS 快照 FFT：%1").arg(error));
+    }
+}
+
+void MainWindow::requestScopeEnvelope()
+{
+    if (!m_client.isConnected()) {
+        appendLog(QStringLiteral("ERR"), QStringLiteral("未连接板端，无法读取 PS 整周期包络。"));
+        return;
+    }
+    if (m_lastBoardState != 1) {
+        appendLog(QStringLiteral("ERR"),
+                  QStringLiteral("SCOPE ENVELOPE 要求板端 RUNNING；先启动连续采集并确认 STATUS state=1。"));
+        return;
+    }
+    if (m_snapshotStage != SnapshotStage::Idle || m_prpdRound != PrpdRound::Idle ||
+        m_scopeFftInFlight || m_snapshotFftInFlight || m_eventDownloadInFlight ||
+        m_scopeEnvelopeInFlight || m_scopeEnvelopeRequestPending) {
+        appendLog(QStringLiteral("ERR"), QStringLiteral("TCP 正忙，请等当前事件/FFT/快照操作结束后再读包络。"));
+        return;
+    }
+
+    m_scopeEnvelopeOwnsSuspend = m_stream != nullptr && m_stream->isRunning() &&
+                                 !m_stream->isSuspended();
+    m_scopeEnvelopeRequestPending = true;
+    if (m_scopeEnvelopeOwnsSuspend) m_stream->setSuspendRequests(true);
+    if (m_stream == nullptr || !m_stream->isFrameInFlight()) beginScopeEnvelopeTransfer();
+    else if (m_scopeEnvelopeStatus != nullptr)
+        m_scopeEnvelopeStatus->setText(QStringLiteral("等待当前 SCOPE 帧结束，再计算整周期包络…"));
+}
+
+void MainWindow::beginScopeEnvelopeTransfer()
+{
+    if (!m_scopeEnvelopeRequestPending || m_scopeEnvelopeInFlight) return;
+    if (!m_client.isConnected()) {
+        finishScopeEnvelopeRequest(QStringLiteral("TCP 已断开。"));
+        return;
+    }
+    if (m_stream != nullptr && m_stream->isFrameInFlight()) return;
+    m_scopeEnvelopeRequestPending = false;
+    m_scopeEnvelopeInFlight = true;
+    if (m_scopeEnvelopeStatus != nullptr)
+        m_scopeEnvelopeStatus->setText(QStringLiteral("PS 正在从最新 520,000 点 SNAP 计算 1024 列 min/max…"));
+    m_client.sendCommand(QStringLiteral("SCOPE ENVELOPE"));
+}
+
+void MainWindow::finishScopeEnvelopeRequest(const QString &error)
+{
+    if (!m_scopeEnvelopeInFlight && !m_scopeEnvelopeRequestPending) return;
+    const bool resumeStream = m_scopeEnvelopeOwnsSuspend;
+    m_scopeEnvelopeInFlight = false;
+    m_scopeEnvelopeRequestPending = false;
+    m_scopeEnvelopeOwnsSuspend = false;
+    if (!error.isEmpty()) {
+        if (m_scopeEnvelopeStatus != nullptr)
+            m_scopeEnvelopeStatus->setText(QStringLiteral("整周期包络失败/未就绪：%1").arg(error));
+        appendLog(QStringLiteral("ERR"), QStringLiteral("SCOPE ENVELOPE：%1").arg(error));
+    }
+    if (resumeStream && m_stream != nullptr &&
+        m_stream->state() == ScopeStream::State::Streaming &&
+        m_snapshotStage == SnapshotStage::Idle && m_prpdRound == PrpdRound::Idle)
+        m_stream->setSuspendRequests(false);
+}
+
 /* ------------------------------------------------------------------ 归档下载与绘图 */
 
 void MainWindow::requestDownload()
 {
+    if (m_snapshotFftInFlight || m_scopeEnvelopeInFlight || m_scopeEnvelopeRequestPending) {
+        appendLog(QStringLiteral("ERR"), QStringLiteral("PS FFT/包络传输中，请稍后下载归档。"));
+        return;
+    }
     if (scopeIsActive()) {
         appendLog(QStringLiteral("ERR"),
                   QStringLiteral("取帧进行中：请先点“暂停并抓取快照”，板端同一时刻只允许一个二进制传输。"));
@@ -1776,6 +2078,10 @@ void MainWindow::sendPrpdBins(int channel)
 
 void MainWindow::requestPrpdBins()
 {
+    if (m_snapshotFftInFlight || m_scopeEnvelopeInFlight || m_scopeEnvelopeRequestPending) {
+        appendLog(QStringLiteral("ERR"), QStringLiteral("PS FFT/包络传输中，请稍后读取 PRPD 桶。"));
+        return;
+    }
     if (!m_client.isConnected()) {
         appendLog(QStringLiteral("ERR"), QStringLiteral("未连接板端。"));
         return;
@@ -1830,6 +2136,7 @@ bool MainWindow::refreshSpectrumFor(const pdsample::WaveformFrame &frame,
                                     bool completesPrpdEvent)
 {
     if (!m_client.isConnected() || m_stream == nullptr || m_scopeFftInFlight ||
+        m_scopeEnvelopeInFlight || m_scopeEnvelopeRequestPending ||
         frame.sampleCount != 1024 || frame.sequence < 0 ||
         m_fftChannelSelector == nullptr || m_spectrumPlot == nullptr)
         return false;
@@ -1913,12 +2220,23 @@ void MainWindow::onSnapshotDecoded(WaveformFramePtr frame, pdsample::ChannelStat
                                    pddetect::Result pulses, qint64 sequence,
                                    const QString &sourceName, const QString &error)
 {
-    Q_UNUSED(sequence);
     if (!error.isEmpty() || frame.isNull()) {
+        m_staticSnapshotReady = false;
+        if (m_snapshotFftButton != nullptr) m_snapshotFftButton->setEnabled(false);
         appendLog(QStringLiteral("ERR"),
                   error.isEmpty() ? QStringLiteral("快照解码返回空帧，未绘图。") : error);
         return;
     }
+
+    m_staticSnapshotSequence = sequence >= 0 && sequence < 0xFFFFFFFFLL
+                                   ? static_cast<quint32>(sequence) : 0xFFFFFFFFU;
+    m_staticSnapshotSamples = frame->sampleCount;
+    m_staticSnapshotReady = m_staticSnapshotSequence != 0xFFFFFFFFU &&
+                            m_staticSnapshotSamples >= 1024;
+    if (m_snapshotFftStartSample != nullptr)
+        m_snapshotFftStartSample->setRange(0, qMax(0, m_staticSnapshotSamples - 1024));
+    if (m_snapshotFftButton != nullptr)
+        m_snapshotFftButton->setEnabled(m_staticSnapshotReady);
 
     appendLog(QStringLiteral("OK"),
               QStringLiteral("%1：%2 点，min/max = CH0 %3/%4，CH1 %5/%6，CH2 %7/%8，CH3 %9/%10")

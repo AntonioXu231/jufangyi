@@ -132,6 +132,11 @@ private:
     /* 用 evt_seq 统计每通道丢帧（此前完全没用上，是免费的完整性检查）。 */
     void accountEventSequences(const QVector<pdsample::PeakEvent> &events);
     void updatePulseStatistics();
+    void requestSnapshotSpectrum();
+    void finishSnapshotSpectrumRequest(const QString &error = QString());
+    void requestScopeEnvelope();
+    void beginScopeEnvelopeTransfer();
+    void finishScopeEnvelopeRequest(const QString &error = QString());
 
     PdTcpClient m_client;
     ScopeStream *m_stream = nullptr;
@@ -154,6 +159,11 @@ private:
     PlotWidget *m_spectrumPlot = nullptr;
     ScopeWidget *m_singleChannelScope = nullptr;
     QComboBox *m_fftChannelSelector = nullptr;
+    QSpinBox *m_snapshotFftStartSample = nullptr;
+    QPushButton *m_snapshotFftButton = nullptr;
+    QPushButton *m_scopeEnvelopeButton = nullptr;
+    PlotWidget *m_scopeEnvelopePlot = nullptr;
+    QLabel *m_scopeEnvelopeStatus = nullptr;
     QLabel *m_fftStatus = nullptr;
     QTimer *m_scopeFftTimeout = nullptr;
     bool m_scopeFftInFlight = false;
@@ -161,6 +171,17 @@ private:
     bool m_scopeFftCompletesPrpdEvent = false;
     quint32 m_scopeFftExpectedSequence = 0U;
     quint32 m_scopeFftExpectedChannel = 0U;
+    bool m_snapshotFftInFlight = false;
+    quint32 m_snapshotFftExpectedSequence = 0U;
+    quint32 m_snapshotFftExpectedChannel = 0U;
+    quint32 m_snapshotFftExpectedStart = 0U;
+    bool m_staticSnapshotReady = false;
+    quint32 m_staticSnapshotSequence = 0xFFFFFFFFU;
+    int m_staticSnapshotSamples = 0;
+    int m_lastBoardState = -1;
+    bool m_scopeEnvelopeRequestPending = false;
+    bool m_scopeEnvelopeInFlight = false;
+    bool m_scopeEnvelopeOwnsSuspend = false;
     pdsample::WaveformFrame m_lastScopeFrame;
     bool m_hasLastScopeFrame = false;
     PlotWidget *m_prpdPlot = nullptr;

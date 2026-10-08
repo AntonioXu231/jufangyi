@@ -357,6 +357,11 @@ void ScopeStream::onTextLine(const QString &line)
 
 void ScopeStream::handleBoardError(const QString &line)
 {
+    /* SCOPE ENVELOPE is owned by MainWindow, not this short-frame state machine. */
+    if (line.startsWith(QStringLiteral("ERR SCOPE ENVELOPE")) &&
+        !m_frameInFlight && !m_eventFrameInFlight)
+        return;
+
     /*
      * 在"等 SCOPE ON 的 OK"或"探测固件能力"期间，任何 ERR 都说明 SCOPE 没被接受。
      * 以前这里只匹配已知字符串，导致 "ERR unknown command" 被静默忽略，

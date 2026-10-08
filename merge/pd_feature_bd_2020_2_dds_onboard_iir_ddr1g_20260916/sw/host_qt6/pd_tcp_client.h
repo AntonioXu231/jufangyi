@@ -40,6 +40,14 @@ signals:
                             quint32 channel, quint32 sampleRateHz,
                             quint32 peakBin, quint32 peakHz,
                             quint32 amplitudeCode, quint32 dcCode);
+    void snapshotSpectrumFrame(const QByteArray &magnitudesLe, quint32 sequence,
+                               quint32 index, quint32 channel, quint32 startSample,
+                               quint32 snapshotSamples,
+                               quint32 sampleRateHz, quint32 peakBin, quint32 peakHz,
+                               quint32 amplitudeCode, quint32 dcCode);
+    void scopeEnvelopeFrame(const QByteArray &minMaxLe, quint32 sequence,
+                            quint32 snapshotSequence, quint32 samples, quint32 bins,
+                            quint32 sampleRateHz, quint32 lockMask);
 
 private slots:
     void onReadyRead();
@@ -75,6 +83,22 @@ private:
     quint32 m_scopeFftPeakHz = 0;
     quint32 m_scopeFftAmplitudeCode = 0;
     quint32 m_scopeFftDcCode = 0;
+    quint32 m_snapshotFftSequence = 0;
+    quint32 m_snapshotFftIndex = 0;
+    quint32 m_snapshotFftChannel = 0;
+    quint32 m_snapshotFftStartSample = 0;
+    quint32 m_snapshotFftSnapshotSamples = 0;
+    quint32 m_snapshotFftSampleRateHz = 0;
+    quint32 m_snapshotFftPeakBin = 0;
+    quint32 m_snapshotFftPeakHz = 0;
+    quint32 m_snapshotFftAmplitudeCode = 0;
+    quint32 m_snapshotFftDcCode = 0;
+    quint32 m_scopeEnvSequence = 0;
+    quint32 m_scopeEnvSnapshotSequence = 0;
+    quint32 m_scopeEnvSamples = 0;
+    quint32 m_scopeEnvBins = 0;
+    quint32 m_scopeEnvSampleRateHz = 0;
+    quint32 m_scopeEnvLockMask = 0;
     QByteArray m_download;
     bool m_wholeSnapshot = false;
     bool m_wholeEventRecord = false;

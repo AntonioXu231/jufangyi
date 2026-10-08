@@ -266,6 +266,8 @@ int pd_spectrum_self_test(pd_spectrum_result_t *result)
     static u8 raw[PD_FFT_POINTS * PD_SNAPSHOT_BYTES_PER_SAMPLE];
     static const u32 expected_bin[PD_SNAPSHOT_CHANNELS] = {37U, 83U, 151U, 255U};
     u16 value[PD_SNAPSHOT_CHANNELS];
+    u16 channel_bins[PD_FFT_POINTS / 2U + 1U];
+    pd_spectrum_channel_t channel_result;
     u32 i, channel, phase;
 
     if (result == 0) return XST_FAILURE;
@@ -290,5 +292,12 @@ int pd_spectrum_self_test(pd_spectrum_result_t *result)
             result->channel[channel].amplitude_code > 1150U)
             return XST_FAILURE;
     }
+    if (pd_spectrum_analyze_channel(raw, sizeof(raw), 0U,
+                                    PD_SPECTRUM_DEFAULT_FS_HZ, 2U,
+                                    channel_bins, &channel_result) != XST_SUCCESS ||
+        channel_result.peak_bin != expected_bin[2] ||
+        channel_bins[expected_bin[2]] < 900U ||
+        channel_bins[expected_bin[2]] > 1150U)
+        return XST_FAILURE;
     return XST_SUCCESS;
 }

@@ -76,7 +76,8 @@ Qt 累计并显示明确 gap，而不是静默跳过。每轮摘要显示处理�
 | **示波器：波形 + 椭圆图谱** | 上=四通道波形（含 PD 脉冲标注，可缩放/游标/触发），下=1×4 椭圆图谱（可缩放），两者同时常时刷新 |
 | **PRPD 散点（相位-幅值）** | 2×2 标准 PRPD 直角坐标，与椭圆图同一批事件 |
 | 归档记录波形（暂停抓取） | 暂停抓取的快照，横轴为连续时间 |
-| 单通道实时页 | 从最近的 `SCOPE` 帧选择一个通道，PS 执行 Hann/去直流 1024 点 FFT，Qt 校验 CRC 后只绘制 513 个单边幅值码；静态全周期快照的 FFT bins 仍未接入 PS 接口。 |
+| 单通道波形 + PS FFT | 实时模式从最近 `SCOPE` 帧取 PS FFT；载入完整归档快照后，可指定通道与快照内 1024 点起点，请求 PS 返回该窗口的 513 个 bins，Qt 校验序号/通道/起点/快照点数/CRC 后绘图。 |
+| 整周期包络（PS min/max） | 手动读取 PS 对最新完整 SNAP 归约出的 1024 列×四通道 min/max 包络；只作压缩预览，原始 520,000 点仍通过完整 SNAP 下载。 |
 | PRPD 相位直方图 | `PRPD BINS` 64 桶（**需要 IDLE**，先暂停抓快照再读） |
 
 > **不要把"滚动"波形模式当成连续时间轴。** 板端 `SCOPE` 每次只推送 DDR 环上
@@ -135,7 +136,7 @@ PL 的 `cfg_thresh` 只负责产生候选事件、保护硬件吞吐；现场可
 
 - Qt 6.4+（已在 Qt 6.10.1 MinGW 64-bit 验证）、Qt 模块 `Widgets`/`Network`、
   CMake 3.21+、Ninja。
-- 板端需运行含 `SCOPE`、`SCOPE FFT CHANNEL` 与 `SCOPE EVENT SEQ` 命令的 PS TCP 服务（当前代码 `CONFIG api=16`，至少应包含相应 `scope_fft=`、`scope_env=` 能力字段）。Qt 已接入 `SCOPE_FFT V1` 帧解析；`SCOPE_ENV` 响应解析仍未实现。
+- 板端需运行含 `SCOPE`、`SCOPE FFT CHANNEL`、`FFT BINS SNAP SEQ`、`SCOPE ENVELOPE` 与 `SCOPE EVENT SEQ` 命令的 PS TCP 服务（当前代码 `CONFIG api=16`，至少应包含 `scope_fft=`、`snap_fft=`、`scope_env=` 能力字段）。Qt 已接入实时 `SCOPE_FFT V1`、静态 `FFT_SNAP_BINS_V1` 和 `SCOPE_ENV V1` 帧解析。
 
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_PREFIX_PATH=<Qt6>/lib/cmake

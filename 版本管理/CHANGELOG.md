@@ -8,6 +8,8 @@
 
 - 预审优化：PS `CONFIG` 只读回报 PL 四通道 SCALE，Qt 在四路一致时自动同步；Qt 事件幅值按 SCALE 折回 AD 码；事件读取改为最旧序号优先、连续游标、失败重试和覆盖缺口计数；事件包分段下载支持完整 64 KiB 记录；`SCOPE EVENT` 可指定记录/通道/事件字序号；新增单通道实时波形 + PS FFT 页、50 ms 合并绘图、15 秒到达时间窗口和 1,000,000 点/通道上限。
 - PS 内存地图增加编译期基地址、地址窗、快照/事件环邻接关系及 DMA buffer 避碰检查；仍需与 Vitis linker/heap 区间核对。
+- P1 代码推进：PS 新增静态 SNAP 指定通道/起点的 1024 点 FFT bins 二进制接口；Qt 单通道页新增静态快照 FFT 控件，按快照序号/通道/起点/样本数/CRC 校验后绘图；PS FFT 自检覆盖单通道 bins 路径。尚未构建或联板验证。
+- P1 代码推进：Qt 新增手动读取 PS `SCOPE_ENV V1` 的整周期 min/max 包络页；读取期间暂停新的 SCOPE 帧请求，按 lock/seq/samples/bins/fs/CRC 校验后恢复。它是 1024 列压缩预览，不代替原始 520,000 点 SNAP。
 - 用户提供的 Vitis `xparameters.h` 与新 `pd_feature_bd_wrapper5.xsa` HWH 均已确认 `pd_ddr=0x40000000`、`pd_feature=0x40010000`、`pd_filter=0x40020000`。另外三份旧 XSA/HWH 仍保留历史映射，需注明/归档以免误选。
 - CDC 审查结论：未保留此前试验的 FIFO 非空即全速读取改动；该做法会破坏样本间隔。可选独立 CDC 的速率匹配列为未解决风险；当前 BD `INPUT_CDC=0`。
 - 详细模块审查、旧版 XSA 归档风险和剩余签核工作见 `merge/pd_feature_bd_2020_2_dds_onboard_iir_ddr1g_20260916/项目审查优化报告_v1.9.1.md`；本轮未在 Vivado 2020.2 做仿真/综合/实现，也未做 PS/Qt 构建。
@@ -15,6 +17,7 @@
 ### 2026-10-04 · v1.9.1 预审备份（本地，非发布）
 
 - 将 `merge/pd_feature_bd_2020_2_dds_onboard_iir_ddr1g_20260916` 的当前工作树作为本地备份分支保存，覆盖本工程已有的 PL、PS、Qt6 源码修改、工程文件、XSA 与学习文档；因本机无 GitHub 凭据，尚未推送。
+- 在开始 P1 收敛前又创建本地检查点 `893ca49`；其后的静态快照 FFT 源码推进尚未提交。
 - 此备份尚未经过目标 Vivado 2020.2 的仿真、综合、实现、时序与上板复验；仅作审查前恢复点，不合并到 `main`、不创建发布标签。
 - 详细范围与已执行的静态检查见 `变更记录/v1.9.1-pre-review-backup.md`。
 
