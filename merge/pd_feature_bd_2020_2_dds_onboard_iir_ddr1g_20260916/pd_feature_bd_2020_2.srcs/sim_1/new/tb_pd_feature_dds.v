@@ -3,35 +3,35 @@
 module tb_pd_feature_dds;
   reg clk=0, adc_clk=0, rst_n=0, sync_in=0;
   always #3.846 clk=~clk;          // 130 MHz
-  always #19.231 adc_clk=~adc_clk; // 26 MHz
+  always #7.692307692 adc_clk=~adc_clk; // 65 MHz, synchronous 2:1 to 130 MHz
   reg [47:0] adc_data=0; reg [3:0] adc_dv=0;
   reg [15:0] awaddr=0, araddr=0; reg [2:0] awprot=0, arprot=0;
   reg awvalid=0,wvalid=0,bready=1,arvalid=0,rready=1; reg [31:0] wdata=0; reg [3:0] wstrb=4'hf;
   wire awready,wready,bvalid,arready,rvalid,irq; wire [1:0] bresp,rresp; wire [31:0] rdata;
   wire [63:0] m_axis_tdata; wire m_axis_tvalid,m_axis_tlast; reg m_axis_tready=1;
   integer sample_n=0, event_n=0; reg [3:0] channel_seen=0; real theta; integer base;
-  // 26 MSPS / 50 Hz = 520000 ADC samples per mains cycle.
+  // 65 MSPS / 50 Hz = 1300000 ADC samples per mains cycle.
   // Keep this tied to the MATLAB stimulus time base, not to phase-window count.
-  localparam integer SYNC_PERIOD_SAMPLES = 520000;
-  // One quiet cycle lets the DUT measure a 520000-sample period before the
-  // first MATLAB event, avoiding its 20-MSPS power-up default (400000 samples).
+  localparam integer SYNC_PERIOD_SAMPLES = 1300000;
+  // One quiet cycle lets the DUT measure a 1300000-sample period before the
+  // first MATLAB event, avoiding use of a stale nominal-period estimate.
   localparam integer WARMUP_SAMPLES = SYNC_PERIOD_SAMPLES;
   // Include channel DC offsets when rejecting background/weak pickup while
   // retaining the 430--700 LSB primary PD pulses.
   localparam [31:0] PD_THRESH_LSB = 32'd250;
   integer event_fd;
   localparam USE_MATLAB_SAMPLES = 1'b1;
-  reg [47:0] matlab_samples [0:1039999];
+  reg [47:0] matlab_samples [0:2599999];
   initial begin
     if (USE_MATLAB_SAMPLES) begin
-      $readmemh("pd_adc_4ch_26m_40ms.mem", matlab_samples);
-      $display("MATLAB_STIMULUS_LOADED: pd_adc_4ch_26m_40ms.mem (1040000 samples)");
+      $readmemh("pd_adc_4ch_65m_40ms.mem", matlab_samples);
+      $display("MATLAB_STIMULUS_LOADED: pd_adc_4ch_65m_40ms.mem (2600000 samples, 65 MSPS)");
     end else begin
       $display("INTERNAL_DDS_STIMULUS_ACTIVE");
     end
   end
 
-  pd_feature_sys_top #(.INPUT_CDC(1),.CLK_HZ(130000000),.SAMPLE_HZ(26000000)) dut (
+  pd_feature_sys_top #(.INPUT_CDC(1),.CLK_HZ(130000000),.SAMPLE_HZ(65000000)) dut (
     .clk(clk),.rst_n(rst_n),.adc_clk(adc_clk),.adc_data(adc_data),.adc_dv(adc_dv),.sync_in(sync_in),
     .s_axi_awaddr(awaddr),.s_axi_awprot(awprot),.s_axi_awvalid(awvalid),.s_axi_awready(awready),
     .s_axi_wdata(wdata),.s_axi_wstrb(wstrb),.s_axi_wvalid(wvalid),.s_axi_wready(wready),.s_axi_bresp(bresp),.s_axi_bvalid(bvalid),.s_axi_bready(bready),
@@ -50,7 +50,7 @@ module tb_pd_feature_dds;
     else begin
       adc_dv<=4'hf; sync_in <= ((sample_n % SYNC_PERIOD_SAMPLES)==0);
       if (USE_MATLAB_SAMPLES) begin
-        if ((sample_n >= WARMUP_SAMPLES) && (sample_n < (WARMUP_SAMPLES + 1040000)))
+        if ((sample_n >= WARMUP_SAMPLES) && (sample_n < (WARMUP_SAMPLES + 2600000)))
           adc_data <= matlab_samples[sample_n - WARMUP_SAMPLES];
         else
           adc_data <= {4{12'd2048}}; // quiet preamble/postamble; no false event source
@@ -90,7 +90,7 @@ module tb_pd_feature_dds;
     axil_write(16'h0080,32'h1); axil_write(16'h008C,PD_THRESH_LSB);
     axil_write(16'h0100,32'h1); axil_write(16'h010C,PD_THRESH_LSB);
     axil_write(16'h0180,32'h1); axil_write(16'h018C,PD_THRESH_LSB);
-    // 20 ms lock preamble + 40 ms MATLAB data at 130 MHz.
+    // 20 ms lock preamble + 40 ms MATLAB data at 130 MHz system clock.
     repeat(7800000) @(posedge clk);
     if (event_n == 0) $fatal(1,"DDS regression: no AXI-Stream event observed");
     if (channel_seen != 4'hf) $fatal(1,"DDS regression: not all channels emitted events: %b",channel_seen);
