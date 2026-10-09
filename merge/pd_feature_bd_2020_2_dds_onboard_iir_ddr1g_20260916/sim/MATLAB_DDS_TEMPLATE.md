@@ -1,34 +1,72 @@
-# 板载 DDS 改用 MATLAB 局放脉冲模板
+# 65 MSPS MATLAB 局放激励与验证说明
 
-## 本次变更
+## 最终采样配置
 
-`pd_dds_adc_source.v` 的接口、26 MSPS 数据有效节拍和 50 Hz `sync_in` 不变。四路原有的短脉冲函数已换成四段各 32 个采样点的 12-bit ADC 码模板，每个 20 ms 周期分别在约 45°、135°、225°、315° 重播。模板取自 `pd_adc_4ch_26m_40ms.mem`；该文件由 `generate_pd_adc_waveform.m` **模拟生成**，并非现场实测数据。背景仍是原来的低幅度三角波，因此目前并未逐点重放 MATLAB 文件中的整段背景和所有脉冲。
+- 器件：Zynq-7020 `xc7z020clg400-2`，Vivado 2020.2。
+- PL 系统时钟：130 MHz；ADC/DDS 采样时钟：65 MHz，整数比 2:1。
+- 工频：50 Hz；每周期 1,300,000 点；40 ms 完整四通道仿真记录为 2,600,000 点。
+- 每个采样时刻按 `{CH3, CH2, CH1, CH0}` 打包成 48 位，每周期原始数据 7,800,000 字节。
 
-完整 40 ms、四路、26 MSPS 文件需要 1,040,000 × 48 = 49,920,000 bit。Zynq-7020 的片上 BRAM 容量不足以按 ROM 放入整段文件；本实现的四路模板只有 4 × 32 × 12 = 1,536 bit。若未来要重放完整实测记录，应存储在 PS DDR 中，经 DMA/AXI-Stream 持续喂入 PL，而不是扩大 `reg` 数组或 `$readmemh` 片上 ROM。
+## 生成完整的 MATLAB 仿真波形
 
-## 文件与导入
+运行 [`generate_pd_adc_waveform_physical_model.m`](generate_pd_adc_waveform_physical_model.m)：
 
-- 板载可综合源：`pd_feature_bd_2020_2.srcs/sources_1/imports/rtl/pd_dds_adc_source.v`
-- 新增源级测试：`sim/tb_pd_dds_matlab_template.v`
-- 模板来源：`sim/pd_adc_4ch_26m_40ms.mem`、`sim/generate_pd_adc_waveform.m`
+```matlab
+run('F:/xinya/v5/merge/pd_feature_bd_2020_2_dds_onboard_iir_ddr1g_20260916/sim/generate_pd_adc_waveform_physical_model.m')
+```
 
-原 Vivado 工程已引用同一路径的 `pd_dds_adc_source.v`，不需要在 BD 中新增 IP 或改端口。可选的源级测试只需将上述 `.v` 与测试文件加入 `sim_1`，把仿真 top 设为 `tb_pd_dds_matlab_template`。预期输出 `DDS_MATLAB_TEMPLATE_PASS channels=4 period_samples=520000`。此测试不读取大 `.mem` 文件；原顶层 MATLAB 测试仍独立使用完整文件。
+脚本输出：
 
-用户自行完成仿真、综合、实现和 bitstream。只有新的 `.bit` 真正下载到板端，板载 DDS 才会变化。若 Vitis 启动配置自动下载平台内旧的 bitstream，需要从新 Vivado 实现导出带 bitstream 的 XSA 并更新平台，或明确指定新的 `.bit`；单独更新 ELF 不会改变 DDS。
+- `pd_adc_4ch_65m_40ms.mem`：2,600,000 行、每行 12 个十六进制字符的四通道采样数据。
+- `pd_event_truth_physical_65m.csv`：每个注入脉冲的通道、周期、样点、相位、极性、幅度和振铃频率。
+- `coe_templates/pd_pulse_ch0.coe` 至 `pd_pulse_ch3.coe`：四路各 1024 个有符号 Q1.11 脉冲形状采样，供板载 ROM 流式播放。
+- `pd_stream_event_schedule_65m.csv`：重复播放周期的事件时刻；邻近事件如发生模板重叠，会按需顺延并记录实际相位。
+- RTL 目录下的 `pd_pd_event_schedule.v`：与上述 CSV 同步生成的事件调度器。
 
-## 板端验收
+波形含快速前沿、衰减尾波、传感器振铃、50 Hz 相位簇、通道串扰及带限噪声；它是可复现的“物理启发式合成激励”，不是现场采集记录，也不能当作标定/验收实测数据。现场真实波形必须由实际 ADC 采集后导入。
 
-1. 先确认新 bitstream 已下载，再运行已有 PS 采集服务，并用 TCP `CONFIG` 检查服务协议版本。UI/PS 的相位显示版本应为 `api=13`；`SCOPE PHASE` 预期四路 `wins=1024,1024,1024,1024`，约一个完整 50 Hz 周期后 `lock=f`。
-2. 连续波形应有各通道对应的窄脉冲；每 20 ms 重现一次。相位椭圆只在 PL 输出峰值事件且同步锁定时增加真实相位点。当前原始波形帧和 PL 峰值事件**没有共同样本编号**，因此不能宣称两处高亮是同一采样点的严格对齐。
-3. 模板的主偏离量约为 CH0 1130、CH1 879、CH2 337、CH3 707 ADC LSB。上位机候选脉冲阈值若仍为 `850 raw ADC`，通常只能看到 CH0/CH1；要观察四路可先试 `250 raw ADC`，再按噪声实测调整。PL 峰值事件是否出现还取决于其独立阈值和滤波配置。
-4. 如需真正的现场实测波形，请提供原始 `.mat`/CSV、四路编码方式、采样率、ADC 零点及幅值标定。当前的“真实”仅指模板是从 MATLAB 文件逐点提取，不代表它是现场采集。
+`.mem` 是完整双周期仿真的离线输入，不会被综合到 FPGA，也不是板载 DDS 的数据源。板载测试只使用四个短 COE 模板和事件调度器；因此无需把 40 ms、2,600,000 点记录装入片上 ROM。MATLAB 文件仍会输出 `.mem`，以保留现有全路径仿真的能力。
 
-## 65 MSPS 全采样仿真激励
+## 板载 COE 流式 DDS
 
-`generate_pd_adc_waveform_physical_model.m` 生成 65 MSPS、50 Hz、40 ms 的四通道完整仿真向量：每周期 1,300,000 个采样时刻，共 2,600,000 行 48-bit `{CH3,CH2,CH1,CH0}`，并输出事件真值 CSV。波形是包含快前沿、传感器阻尼振铃、50 Hz 相位簇、通道串扰及带限噪声的**物理启发式合成数据**，不是现场测量。
+板载测试模式每个 65 MHz 时钟输出一组 4×12-bit ADC 码，封装总线仍为 `{CH3, CH2, CH1, CH0}`（48 位是四路同时采样的打包宽度，不代表单路 ADC 是 48 位）。每通道使用一个 1024×12-bit、单端口同步 ROM，按样点地址顺序读取模板；模板约 15.75 μs，事件调度器在每个 50 Hz 周期重复 MATLAB 第一个周期的 `[8, 9, 7, 10]` 个事件及其极性/幅值。四个 ROM 的有效初始化内容共 49,152 bit（6 KiB）；它们只保存短脉冲形状，不保存完整工频周期波形。
 
-完整功能仿真 `pd_feature_bd_2020_2.srcs/sim_1/new/tb_pd_feature_dds.v` 已与该 65 MSPS 激励配套：ADC 时钟 65 MHz，系统时钟 130 MHz，`INPUT_CDC=1`、`SAMPLE_HZ=65000000`，同步周期 1,300,000 点；测试仍先运行 20 ms 安静周期，再输入 40 ms MATLAB 数据。运行生成器后，需将生成的 `.mem` 加入 Vivado 仿真工作目录，再运行该 testbench。
+新生成/修改 COE 后，在 Vivado 2020.2 中打开本工程并在 Tcl Console 执行：
 
-注意：这只把**完整功能仿真**切到 65 MSPS。板载自检 DDS `pd_dds_adc_source.v` 仍明确以 26 MHz 运行并输出 32 点短模板；本 MATLAB 文件不会改变其综合实现或板上波形。要让真实板端以 65 MSPS 工作，还必须另外核实并同步修改 ADC/PL 时钟、BD/XDC、DDS/CDC 参数、采集缓冲大小和 PS 采样率配置，不能仅凭仿真通过就上板。
+```tcl
+source {F:/xinya/v5/merge/pd_feature_bd_2020_2_dds_onboard_iir_ddr1g_20260916/scripts/13_configure_matlab_coe_roms.tcl}
+```
 
-这次未在本机运行 Vivado、Vitis、板端或 Qt；上述均为用户执行时的预期验收条件。
+脚本会创建/更新四个 Block Memory Generator 8.4 ROM，加载对应 COE，并将 `pd_pd_event_schedule.v` 加入综合源；不会清除或重置综合/实现运行。已有的 `scripts/06_enable_onboard_dds_test_mode.tcl` 也会调用该配置脚本。
+
+完成 IP 配置后，在 PowerShell 执行：
+
+```powershell
+& 'F:\xinya\v5\merge\pd_feature_bd_2020_2_dds_onboard_iir_ddr1g_20260916\scripts\14_simulate_matlab_coe_stream.ps1'
+```
+
+预期输出 `DDS_COE_STREAM_PASS channels=4 bits_per_channel=12 samples_per_cycle=1300000 events=8/9/7/10`。回归覆盖完整一个 20 ms 周期，检查逐通道事件数、ROM 脉冲可见性、连续 `adc_dv` 和 50 Hz `sync_in` 对齐。仿真工作目录默认放在 `F:\xinya\v5\.codex_tmp\pd_coe_stream_xsim`，以避免 Vivado 在系统盘临时目录空间不足。
+
+OOC 综合检查可执行：
+
+```tcl
+source {F:/xinya/v5/merge/pd_feature_bd_2020_2_dds_onboard_iir_ddr1g_20260916/scripts/15_check_pd_coe_source_synthesis.tcl}
+```
+
+预期输出 `PD_COE_SOURCE_SYNTH_PASS`。它综合四个 BMG ROM 和独立 DDS 源模块，不重置工程 `synth_1`/`impl_1`；这不是整个 Block Design 的综合/实现签核。
+
+该 DDS 是合成测试激励，不是现场实测波形。真实 ADC 运行也应逐样点连续采集，不需要先把 40 ms 数据放进 BRAM；真实硬件的限制转为 ADC/PL→FIFO/DDR/DMA 的持续吞吐、跨时钟域和缓冲区覆盖/丢样，而不是 ROM 容量。65 MSPS×4 路×12 bit 的原始总输入速率为 390 MB/s（未计协议/对齐开销），必须按实际 DMA/DDR 路径和缓存设计验证。
+
+## 仿真入口
+
+- 完整采集/事件路径：`pd_feature_bd_2020_2.srcs/sim_1/new/tb_pd_feature_dds.v`。顶层为 `tb_pd_feature_dds`，使用 130 MHz 系统时钟、65 MHz ADC 时钟和 1,300,000 点同步周期；先运行 20 ms 锁相预热，再送入 40 ms MATLAB 激励。生成 `.mem` 后运行，预期结尾为 `DDS_TEST_PASS events=... channels=1111`。
+- 板载 COE DDS 源级测试：`sim/tb_pd_dds_matlab_template.v`。使用四路 1024×12-bit ROM 在 65 MHz 下验证每个通道的事件脉冲和 50 Hz 同步，预期 `DDS_COE_STREAM_PASS ... events=8/9/7/10`。该测试不读取完整 MATLAB `.mem`。
+- IIR 流水吞吐测试：`pd_feature_bd_2020_2.srcs/sim_1/new/tb_pd_filter_chain.v`。以 unity 系数检查四通道滤波开启时能每两拍接收一个样点；Vivado Simulator 2020.2 已通过 `TB_PD_FILTER_CHAIN_PASS`。
+
+板载 DDS 是可综合的短模板自检源，不会把 40 ms 完整 `.mem` 放进 Zynq-7020 片上 ROM。COE 模板由 MATLAB 合成脉冲形状生成，并由 50 Hz 调度器重复播放；它不是完整记录回放或现场 ADC 数据。
+
+本次 ROM 仅接在现有板载测试源 `pd_dds_adc_source` 后，未改局放特征核心、DDR 环形缓存、PS 服务接口或 ILA 配置。切换真实 ADC 时，后续只需撤销/删除该测试源及对应测试模式连接，恢复 ADC 引脚/XDC 接入；BMG 测试 ROM 不属于真实采集必需路径。
+
+## 上板前还需完成
+
+65 MHz Clock Wizard 与 130 MHz 系统时钟的 Block Design 已通过 Vivado 2020.2 `validate_bd_design` 并生成 BD/IP 输出；PS 65 MSPS 源码已同步到 Vitis 应用并成功构建 ELF。综合、实现、时序/资源检查、bitstream 下载、XSA 重新导出以及 Vitis 平台更新仍须作为后续硬件验证步骤完成。下载新 ELF 本身不会改变 PL 的时钟或 DDS。

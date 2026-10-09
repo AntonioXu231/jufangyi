@@ -3,11 +3,13 @@
 #include "demo_source.h"
 #include "event_table_model.h"
 #include "single_channel_page.h"
+#include "single_phase_page.h"
 #include "zynq_scope_source.h"
 
 #include <QApplication>
 #include <QDockWidget>
 #include <QDoubleSpinBox>
+#include <QElapsedTimer>
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -21,6 +23,7 @@
 #include <QTableView>
 #include <QTabWidget>
 #include <QThread>
+#include <QTimer>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -102,6 +105,7 @@ MainWindow::MainWindow()
         controlBox);
     m_diagnostics->setWordWrap(true);
     m_diagnostics->setStyleSheet(QStringLiteral("color:#8fdcff;font-size:11px;"));
+    m_latestStreamDiagnostics = m_diagnostics->text();
 
     control->addWidget(new QLabel(QStringLiteral("Zynq IP："), controlBox), 0, 0);
     control->addWidget(m_host, 0, 1);
@@ -138,6 +142,8 @@ MainWindow::MainWindow()
     views->addTab(gridHost, QStringLiteral("四通道实时图谱"));
     m_singleChannelPage = new SingleChannelPage(views);
     views->addTab(m_singleChannelPage, QStringLiteral("单通道波形 + FFT"));
+    m_singlePhasePage = new SinglePhasePage(views);
+    views->addTab(m_singlePhasePage, QStringLiteral("单通道相位图"));
     layout->addWidget(views, 1);
     setCentralWidget(central);
 
@@ -197,8 +203,17 @@ MainWindow::MainWindow()
                 source->requestSnapshotFft(sequence, channel, startSample);
             }, Qt::QueuedConnection);
     });
+    connect(m_singleChannelPage, &SingleChannelPage::fullSnapshotRequested, this,
+            [this](quint32 sequence, int channel, quint32 startSample) {
+        QMetaObject::invokeMethod(m_zynqSource,
+            [source = m_zynqSource, sequence, channel, startSample] {
+                source->requestFullSnapshotFft(sequence, channel, startSample);
+            }, Qt::QueuedConnection);
+    });
     connect(m_zynqSource, &ZynqScopeSource::phaseEventsReady, this,
             [this](const QVector<PdPulse> &events) {
+        QElapsedTimer batchTimer;
+        batchTimer.start();
         m_phaseEventCount += static_cast<quint64>(events.size());
         QVector<PdPulse> received = events;
         for (auto &event : received) {
@@ -210,12 +225,20 @@ MainWindow::MainWindow()
             QVector<PdPulse> selected;
             for (const auto &event : received)
                 if (event.channel == channel) selected.append(event);
-            if (!selected.isEmpty()) m_panels[channel]->appendPhaseEvents(selected);
+            if (!selected.isEmpty()) {
+                m_panels[channel]->appendPhaseEvents(selected);
+                m_singlePhasePage->appendPhaseEvents(channel, selected);
+            }
         }
         m_status->setText(QStringLiteral(
             "PL峰值 %1；接收时阈值累计通过 %2 / 未通过 %3；15秒事件表 %4 行；%5")
             .arg(m_phaseEventCount).arg(m_phaseEventAccepted).arg(m_phaseEventRejected)
             .arg(m_eventModel->rowCount()).arg(m_transportSummary));
+        const qint64 elapsedNs = batchTimer.nsecsElapsed();
+        ++m_guiEventBatchCount;
+        m_guiEventBatchEvents += static_cast<quint64>(events.size());
+        m_guiEventBatchTotalNs += elapsedNs;
+        m_guiEventBatchMaxNs = qMax(m_guiEventBatchMaxNs, elapsedNs);
     });
     connect(m_zynqSource, &ZynqScopeSource::eventTransportStatus, this,
             [this](quint64 first, quint64 next, quint64 psSkipped,
@@ -226,7 +249,7 @@ MainWindow::MainWindow()
     connect(m_zynqSource, &ZynqScopeSource::connected, this, [this] {
         m_zynqConnected = true;
         m_zynqConnectButton->setText(QStringLiteral("断开 Zynq"));
-        m_status->setText(QStringLiteral("TCP 已连接，等待板端 API 17（批量事件 + 全周期包络 + PS FFT）。"));
+        m_status->setText(QStringLiteral("TCP 已连接，等待板端 API 18（完整 SNAP + 批量事件 + 全周期包络 + PS FFT）。"));
     });
     connect(m_zynqSource, &ZynqScopeSource::disconnected, this, [this] {
         m_zynqConnected = false;
@@ -239,15 +262,20 @@ MainWindow::MainWindow()
             [this](const QString &message) {
         m_lastSourceError = message;
         m_status->setText(QStringLiteral("Zynq 错误：%1").arg(message));
-        m_diagnostics->setText(QStringLiteral("流诊断错误：%1；%2")
-                                   .arg(message, m_transportSummary));
+        refreshDiagnostics();
     });
     connect(m_zynqSource, &ZynqScopeSource::streamDiagnosticsChanged, this,
             [this](const QString &message) {
-        m_diagnostics->setText(m_lastSourceError.isEmpty()
-            ? message
-            : QStringLiteral("%1；最近错误：%2").arg(message, m_lastSourceError));
+        m_latestStreamDiagnostics = message;
+        refreshDiagnostics();
     });
+
+    m_guiPerformanceClock.start();
+    auto *guiPerformanceTimer = new QTimer(this);
+    guiPerformanceTimer->setInterval(1000);
+    connect(guiPerformanceTimer, &QTimer::timeout,
+            this, &MainWindow::collectGuiPerformanceMetrics);
+    guiPerformanceTimer->start();
 
     connect(m_zynqConnectButton, &QPushButton::clicked, this, [this] {
         if (m_zynqConnected) {
@@ -264,6 +292,7 @@ MainWindow::MainWindow()
         m_lastSourceError.clear();
         m_eventModel->clear();
         for (auto *panel : m_panels) panel->clearPhaseEvents();
+        m_singlePhasePage->clearPhaseEvents();
         QMetaObject::invokeMethod(m_zynqSource,
             [source = m_zynqSource, host = m_host->text(), port = m_port->value()] {
                 source->connectToBoard(host, static_cast<quint16>(port));
@@ -283,6 +312,7 @@ MainWindow::MainWindow()
     connect(reset, &QPushButton::clicked, this, [this] {
         for (auto *panel : m_panels) panel->resetZoom();
         m_singleChannelPage->resetZoom();
+        m_singlePhasePage->resetZoom();
     });
     connect(eventTableToggle, &QPushButton::clicked, this, [eventDock, eventTableToggle] {
         eventDock->setVisible(eventTableToggle->isChecked());
@@ -295,6 +325,7 @@ MainWindow::MainWindow()
     connect(m_phaseThreshold, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
             [this](double value) {
         for (auto *panel : m_panels) panel->setPhaseEventThreshold(value);
+        m_singlePhasePage->setEventThreshold(value);
         m_eventModel->setThreshold(value);
         m_status->setText(QStringLiteral("上位机图谱阈值为 %1 Q8.8 码；不修改 PL 门限，原始事件仍按 15 秒保留。")
                           .arg(value, 0, 'f', 0));
@@ -359,10 +390,100 @@ bool MainWindow::passesHostThreshold(const PdPulse &event) const
            std::abs(event.amplitude) >= m_phaseThreshold->value();
 }
 
+void MainWindow::refreshDiagnostics()
+{
+    QString message = m_latestStreamDiagnostics;
+    if (!m_lastSourceError.isEmpty())
+        message += QStringLiteral("；最近错误：%1").arg(m_lastSourceError);
+    if (!m_guiPerformanceSummary.isEmpty())
+        message += QStringLiteral("；%1").arg(m_guiPerformanceSummary);
+    m_diagnostics->setText(message);
+}
+
+void MainWindow::collectGuiPerformanceMetrics()
+{
+    const qint64 windowNs = qMax<qint64>(1, m_guiPerformanceClock.nsecsElapsed());
+    m_guiPerformanceClock.restart();
+
+    WidgetPaintMetrics waveform;
+    WidgetPaintMetrics phase;
+    for (auto *panel : m_panels) {
+        const WidgetPaintMetrics waveformMetrics = panel->takeWaveformPaintMetrics();
+        waveform.paintCount += waveformMetrics.paintCount;
+        waveform.sampleVisits += waveformMetrics.sampleVisits;
+        waveform.eventVisits += waveformMetrics.eventVisits;
+        waveform.totalPaintNs += waveformMetrics.totalPaintNs;
+        waveform.maxPaintNs = qMax(waveform.maxPaintNs, waveformMetrics.maxPaintNs);
+        waveform.maxRetainedEvents =
+            qMax(waveform.maxRetainedEvents, waveformMetrics.maxRetainedEvents);
+
+        const WidgetPaintMetrics phaseMetrics = panel->takePhasePaintMetrics();
+        phase.paintCount += phaseMetrics.paintCount;
+        phase.sampleVisits += phaseMetrics.sampleVisits;
+        phase.bucketVisits += phaseMetrics.bucketVisits;
+        phase.totalPaintNs += phaseMetrics.totalPaintNs;
+        phase.maxPaintNs = qMax(phase.maxPaintNs, phaseMetrics.maxPaintNs);
+        phase.maxRetainedEvents =
+            qMax(phase.maxRetainedEvents, phaseMetrics.maxRetainedEvents);
+    }
+    const WidgetPaintMetrics singleChannel = m_singleChannelPage
+        ? m_singleChannelPage->takeWaveformPaintMetrics() : WidgetPaintMetrics{};
+    const WidgetPaintMetrics singlePhase = m_singlePhasePage
+        ? m_singlePhasePage->takePaintMetrics() : WidgetPaintMetrics{};
+
+    const double windowMs = static_cast<double>(windowNs) / 1000000.0;
+    const double waveformMaxMs = static_cast<double>(waveform.maxPaintNs) / 1000000.0;
+    const double phaseMaxMs = static_cast<double>(phase.maxPaintNs) / 1000000.0;
+    const double maximumBatchMs = static_cast<double>(m_guiEventBatchMaxNs) / 1000000.0;
+    m_guiPerformanceSummary = QStringLiteral(
+        "GUI[%1ms] ev/b=%2/%3 batch tot/max=%4/%5ms; wave tot/max=%6/%7ms paints=%8 samples/events=%9/%10 max/ch=%11; phase tot/max=%12/%13ms paints=%14 samples/buckets=%15/%16; rows=%17")
+        .arg(windowMs, 0, 'f', 0)
+        .arg(m_guiEventBatchEvents)
+        .arg(m_guiEventBatchCount)
+        .arg(static_cast<double>(m_guiEventBatchTotalNs) / 1000000.0, 0, 'f', 2)
+        .arg(maximumBatchMs, 0, 'f', 2)
+        .arg(static_cast<double>(waveform.totalPaintNs) / 1000000.0, 0, 'f', 2)
+        .arg(waveformMaxMs, 0, 'f', 2)
+        .arg(waveform.paintCount)
+        .arg(waveform.sampleVisits)
+        .arg(waveform.eventVisits)
+        .arg(waveform.maxRetainedEvents)
+        .arg(static_cast<double>(phase.totalPaintNs) / 1000000.0, 0, 'f', 2)
+        .arg(phaseMaxMs, 0, 'f', 2)
+        .arg(phase.paintCount)
+        .arg(phase.sampleVisits)
+        .arg(phase.bucketVisits)
+        .arg(m_eventModel ? m_eventModel->rowCount() : 0);
+    if (singleChannel.paintCount > 0U) {
+        m_guiPerformanceSummary += QStringLiteral(
+            "; single_page tot/max=%1/%2ms paints=%3 samples=%4")
+            .arg(static_cast<double>(singleChannel.totalPaintNs) / 1000000.0, 0, 'f', 2)
+            .arg(static_cast<double>(singleChannel.maxPaintNs) / 1000000.0, 0, 'f', 2)
+            .arg(singleChannel.paintCount)
+            .arg(singleChannel.sampleVisits);
+    }
+    if (singlePhase.paintCount > 0U) {
+        m_guiPerformanceSummary += QStringLiteral(
+            "; single_phase tot/max=%1/%2ms paints=%3 samples/buckets=%4/%5")
+            .arg(static_cast<double>(singlePhase.totalPaintNs) / 1000000.0, 0, 'f', 2)
+            .arg(static_cast<double>(singlePhase.maxPaintNs) / 1000000.0, 0, 'f', 2)
+            .arg(singlePhase.paintCount)
+            .arg(singlePhase.sampleVisits)
+            .arg(singlePhase.bucketVisits);
+    }
+
+    m_guiEventBatchCount = 0;
+    m_guiEventBatchEvents = 0;
+    m_guiEventBatchTotalNs = 0;
+    m_guiEventBatchMaxNs = 0;
+    refreshDiagnostics();
+}
+
 void MainWindow::consumeFrame(const ScopeFrame &frame)
 {
     if (frame.fullCycleEnvelope) {
         if (frame.minimum.size() != 4 || frame.maximum.size() != 4) return;
+        m_singlePhasePage->setEnvelopeFrame(frame);
         for (int channel = 0; channel < 4; ++channel) {
             if (frame.minimum[channel].size() != frame.maximum[channel].size()) return;
             const bool channelPhaseLocked =
@@ -372,8 +493,9 @@ void MainWindow::consumeFrame(const ScopeFrame &frame)
                                                 channelPhaseLocked);
         }
         m_status->setText(QStringLiteral(
-            "全周期快照 #%1 · 520,000 原始点/通道 · 四通道包络已刷新 · PL锁相掩码=0x%2 · %3 · %4")
+            "全周期快照 #%1 · %2 原始点/通道 · 四通道包络已刷新 · PL锁相掩码=0x%3 · %4 · %5")
             .arg(frame.sequence)
+            .arg(frame.sourceSampleCount)
             .arg(frame.phaseLockMask, 0, 16)
             .arg(QStringLiteral("仅锁相通道绘制相位包络"))
             .arg(m_transportSummary));
@@ -397,6 +519,8 @@ void MainWindow::consumeFrame(const ScopeFrame &frame)
         m_latestFramePulses[channel] = pulses;
         pulseCount += pulses.size();
         m_panels[channel]->present(frame.samples[channel], pulses, frame.phaseSynchronized);
+        m_singlePhasePage->presentFrame(channel, frame.samples[channel], pulses,
+                                         frame.phaseSynchronized);
     }
     m_singleChannelPage->setFrame(frame, m_latestFramePulses);
     m_status->setText(QStringLiteral(

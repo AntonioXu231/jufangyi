@@ -96,7 +96,7 @@ static void execute_command(char *line)
     if (s_transfer.active || s_scope_envelope.active || s_scope_envelope.ready)
         return; /* Never interleave text and raw payload/job response. */
     if (strcmp(line, "HELP") == 0) {
-    (void)reply("CMD: START [n] | STOP | STATUS | CONFIG | SCOPE ON [samples]|NEXT|ENVELOPE|FFT CHANNEL n(0..3)|EVENT SEQ seq [samples [channel evt_seq]]|PEAKS [BATCH 1..32]|PHASE|OFF | REPORT | SET LIMIT n | SET FFTFS hz | SET ALERT DELTA n|MASK n | ALERT CONFIG|SWEEP n|SNAP SEQ n | RECOVER | CATALOG | EVENT n|SEQ n|DETAIL n|DETAIL SEQ n | PRPD SUMMARY|BINS ch first [count] | SNAP n|SEQ n | ANALYZE SNAP n|SEQ n | FFT CONFIG|SELFTEST|BINS SNAP SEQ n CHANNEL ch START sample|WAVE SNAP SEQ n CHANNEL ch START sample|SNAP n|SEQ n [start]|AUTO SNAP n|SEQ n | SPECTRUM [AUTO] SNAP n|SEQ n [start] | ANALYSIS n|SNAP SEQ n|CATALOG | SWEEP AUTO SNAP n|SEQ n|CATALOG|INDEX n|WINDOW n 0..4|SNAP SEQ n | FEATURE SWEEP n|SNAP SEQ n | BATCH AUTO | GET EVENT|SNAP n|SEQ n offset bytes | CLEAR\r\n");
+    (void)reply("CMD: START [n] | STOP | STATUS | CONFIG | SCOPE ON [samples]|NEXT|ENVELOPE|FFT CHANNEL n(0..3)|EVENT SEQ seq [samples [channel evt_seq]]|PEAKS [BATCH 1..32]|PHASE|OFF | REPORT | SET LIMIT n | SET FFTFS hz | SET ALERT DELTA n|MASK n | ALERT CONFIG|SWEEP n|SNAP SEQ n | RECOVER | CATALOG | EVENT n|SEQ n|DETAIL n|DETAIL SEQ n | PRPD SUMMARY|BINS ch first [count] | SNAP n|SEQ n | ANALYZE SNAP n|SEQ n | FFT CONFIG|SELFTEST|BINS SNAP SEQ n CHANNEL ch START sample|WAVE SNAP SEQ n CHANNEL ch START sample|FULL SNAP SEQ n CHANNEL ch START sample|SNAP n|SEQ n [start]|AUTO SNAP n|SEQ n | SPECTRUM [AUTO] SNAP n|SEQ n [start] | ANALYSIS n|SNAP SEQ n|CATALOG | SWEEP AUTO SNAP n|SEQ n|CATALOG|INDEX n|WINDOW n 0..4|SNAP SEQ n | FEATURE SWEEP n|SNAP SEQ n | BATCH AUTO | GET EVENT|SNAP n|SEQ n offset bytes | CLEAR\r\n");
     } else if (strncmp(line, "START", 5) == 0 && (line[5] == 0 || line[5] == ' ')) {
         if (pd_acq_state() != PD_ACQ_IDLE) (void)reply("ERR already running\r\n");
         else if (pd_acq_start(parse_u32(line + 5, pd_acq_default_packet_limit())) == XST_SUCCESS)
@@ -202,7 +202,9 @@ static void execute_command(char *line)
     } else if (strncmp(line, "GET ", 4) == 0) {
         start_get(line);
     } else if (strcmp(line, "CLEAR") == 0) {
-        if (pd_acq_state() != PD_ACQ_IDLE) (void)reply("ERR CLEAR requires idle\r\n");
+        if (pd_acq_state() != PD_ACQ_IDLE || s_scope_envelope.active ||
+            s_scope_envelope.ready || s_transfer.active)
+            (void)reply("ERR CLEAR requires idle acquisition and no active transfer\r\n");
         else {
             pd_acq_clear_metadata();
             pd_analysis_clear();
@@ -228,6 +230,8 @@ static err_t receive_cb(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t er
         if (s_client == pcb) s_client = NULL;
         s_transfer.active = 0U;
         s_scope.enabled = 0U;
+        if (s_scope_envelope.active != 0U)
+            (void)pd_acq_unpin_snapshot(s_scope_envelope.snapshot_sequence);
         s_scope_envelope.active = 0U;
         s_scope_envelope.ready = 0U;
         s_scope_envelope.cached_valid = 0U;
@@ -260,6 +264,8 @@ static void error_cb(void *arg, err_t err)
     s_line_len = 0U;
     s_transfer.active = 0U;
     s_scope.enabled = 0U;
+    if (s_scope_envelope.active != 0U)
+        (void)pd_acq_unpin_snapshot(s_scope_envelope.snapshot_sequence);
     s_scope_envelope.active = 0U;
     s_scope_envelope.ready = 0U;
     s_scope_envelope.cached_valid = 0U;

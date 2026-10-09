@@ -2,7 +2,7 @@
 // pd_feature_top.v  --  多通道局部放电特征提取 IP 顶层
 // -----------------------------------------------------------------------------
 // 数据流:
-//   ADC(4ch x 12bit @SAMPLE_HZ; current board configuration is 26MSPS)
+//   ADC(4ch x 12bit @SAMPLE_HZ; 65MSPS final-rate configuration)
 //     -> pd_feature_core  分段峰值提取 / 1024 相位窗 / n,I,P,Q 统计 / PRPD 写
 //     -> pd_axis_fifo     突发平滑
 //     -> pd_axis_arb      帧级轮询仲裁
@@ -30,7 +30,7 @@ module pd_feature_top #(
     parameter integer FIFO_AW              = 8,          // 每通道事件 FIFO 深度 = 256
     parameter integer C_S_AXI_DATA_WIDTH   = 32,
     parameter integer C_S_AXI_ADDR_WIDTH   = 16,
-    parameter integer SAMPLE_HZ            = 26000000
+    parameter integer SAMPLE_HZ            = 65000000
 )(
     // ================= 时钟 / 复位 =================
     input  wire                            clk,

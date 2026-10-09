@@ -18,16 +18,17 @@ static void reply_scope_phase(void)
 static void prepare_scope_envelope_header(void)
 {
     (void)snprintf(s_scope_envelope.header, sizeof(s_scope_envelope.header),
-        "SCOPE_ENV V1 seq=%lu snap_seq=%lu samples=%lu bins=%u bytes=%u fs=26000000 lock=%lx phase=cycle_start crc32=%08lx\r\n",
+        "SCOPE_ENV V1 seq=%lu snap_seq=%lu samples=%lu bins=%u bytes=%u fs=%lu lock=%lx phase=cycle_start crc32=%08lx\r\n",
         (unsigned long)s_scope.sequence++,
         (unsigned long)s_scope_envelope.snapshot_sequence,
         (unsigned long)s_scope_envelope.sample_count,
         PD_SCOPE_ENV_BINS, PD_SCOPE_ENV_BYTES,
+        (unsigned long)PD_SPECTRUM_DEFAULT_FS_HZ,
         (unsigned long)s_scope_envelope.lock_mask,
         (unsigned long)s_scope_envelope.checksum);
 }
 
-/* Start an asynchronous full-cycle envelope job.  The heavy 520k-sample
+/* Start an asynchronous full-cycle envelope job.  The heavy 1.3M-sample
  * reduction is deliberately performed by pd_tcp_service_poll(), in bounded
  * chunks, so the lwIP receive callback never monopolizes the acquisition loop. */
 static void start_scope_envelope(void)
@@ -66,6 +67,12 @@ static void start_scope_envelope(void)
         s_scope_envelope.snapshot_bytes == snapshot.bytes) {
         prepare_scope_envelope_header();
         s_scope_envelope.ready = 1U;
+        return;
+    }
+
+    /* Keep the four-slot PS archive record immutable for the full reduction. */
+    if (pd_acq_pin_snapshot(snapshot.sequence) != XST_SUCCESS) {
+        (void)reply("SCOPE_ENV NONE reason=snapshot_busy\r\n");
         return;
     }
 
@@ -110,6 +117,7 @@ static void scope_envelope_step(void)
             current.bytes != s_scope_envelope.snapshot_bytes) {
             s_scope_envelope.active = 0U;
             s_scope_envelope.cached_valid = 0U;
+            (void)pd_acq_unpin_snapshot(s_scope_envelope.snapshot_sequence);
             if (s_client != NULL)
                 (void)reply("SCOPE_ENV SKIP reason=snapshot_overwritten\r\n");
             return;
@@ -169,6 +177,7 @@ static void scope_envelope_step(void)
             prepare_scope_envelope_header();
             s_scope_envelope.active = 0U;
             s_scope_envelope.ready = 1U;
+            (void)pd_acq_unpin_snapshot(s_scope_envelope.snapshot_sequence);
         }
     }
     if (s_scope_envelope.ready && s_client != NULL && !s_transfer.active &&
@@ -190,6 +199,12 @@ static void start_scope(char *line)
     if (strncmp(p, "OFF", 3) == 0 && p[3] == 0) {
         s_scope.enabled = 0U;
         s_scope.last_frame_valid = 0U;
+        if (s_scope_envelope.active != 0U) {
+            (void)pd_acq_unpin_snapshot(s_scope_envelope.snapshot_sequence);
+            s_scope_envelope.active = 0U;
+            s_scope_envelope.cached_valid = 0U;
+        }
+        s_scope_envelope.ready = 0U;
         (void)reply("OK SCOPE OFF\r\n");
         return;
     }
@@ -266,8 +281,9 @@ static void start_scope(char *line)
     {
         char out[96];
         (void)snprintf(out, sizeof(out),
-            "OK SCOPE ON samples=%lu fs=26000000; send SCOPE NEXT\r\n",
-            (unsigned long)s_scope.samples);
+            "OK SCOPE ON samples=%lu fs=%lu; send SCOPE NEXT\r\n",
+            (unsigned long)s_scope.samples,
+            (unsigned long)PD_SPECTRUM_DEFAULT_FS_HZ);
         (void)reply(out);
     }
 }

@@ -19,7 +19,7 @@ module pd_ddr_bd_adapter #(
     (* X_INTERFACE_PARAMETER = "XIL_INTERFACENAME RST, POLARITY ACTIVE_LOW" *)
     (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 rst_n RST" *)
     input  wire                      rst_n,
-    (* X_INTERFACE_PARAMETER = "XIL_INTERFACENAME ADC_CLK, FREQ_HZ 26000000" *)
+    (* X_INTERFACE_PARAMETER = "XIL_INTERFACENAME ADC_CLK, FREQ_HZ 65000000" *)
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 adc_clk CLK" *)
     input  wire                      adc_clk,
     input  wire [CH_NUM*ADC_W-1:0]   adc_data,

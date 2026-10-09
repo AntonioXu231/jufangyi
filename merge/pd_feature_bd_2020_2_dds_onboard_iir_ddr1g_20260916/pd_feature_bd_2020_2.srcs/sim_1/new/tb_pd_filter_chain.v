@@ -77,7 +77,28 @@ module tb_pd_filter_chain;
         end
     endtask
 
+    task check_active_sample;
+        input [47:0] sample;
+        begin
+            @(negedge clk); adc_data=sample; adc_dv=4'hf;
+            @(posedge clk); #1;
+            if(filt_dv !== 4'h0) begin
+                $display("FAIL active filter asserted valid before its commit edge dv=%h",filt_dv);
+                errors=errors+1;
+            end
+            @(negedge clk); adc_dv=4'h0;
+            @(posedge clk); #1;
+            if(filt_dv !== 4'hf || filt_data !== sample) begin
+                $display("FAIL active 65MSPS identity filter data=%h/%h dv=%h/%h",
+                         filt_data,sample,filt_dv,4'hf);
+                errors=errors+1;
+            end
+        end
+    endtask
+
     reg [31:0] rd;
+    reg [15:0] ch_base;
+    integer ch;
     initial begin
         repeat(4) @(negedge clk); rst_n=1;
         check_bypass_sample(48'h123_456_789_abc,4'b1111);
@@ -99,6 +120,28 @@ module tb_pd_filter_chain;
         if(rd !== 32'h0001_ab45) begin $display("FAIL WSTRB coefficient=%h",rd); errors=errors+1; end
         axil_read(16'h0004,rd);
         if(rd[1] !== 1'b1) begin $display("FAIL coefficient dirty=%h",rd); errors=errors+1; end
+
+        // Program a unity-gain identity section on every channel. The filter
+        // is explicitly enabled so this verifies the real datapath, not only
+        // the reset-default bypass path. Samples arrive once every two 130MHz
+        // clocks, i.e. the required continuous 65 MSPS throughput.
+        for(ch=0;ch<4;ch=ch+1) begin
+            ch_base=16'h0010 + ch*16'h0200;
+            axil_write_aw_then_w(ch_base,32'h00000000,4'b0001);
+            axil_write_aw_then_w(ch_base+16'h0004,32'h00010000,4'b1111); // b0=1.0 Q1.16
+            axil_write_aw_then_w(ch_base+16'h0008,32'h00000000,4'b1111); // b1
+            axil_write_aw_then_w(ch_base+16'h000c,32'h00000000,4'b1111); // b2
+            axil_write_aw_then_w(ch_base+16'h0010,32'h00000000,4'b1111); // a1
+            axil_write_aw_then_w(ch_base+16'h0014,32'h00000000,4'b1111); // a2
+            axil_write_aw_then_w(ch_base,32'h00000001,4'b0001);
+        end
+        axil_write_aw_then_w(16'h0000,32'h00000003,4'b0001); // keep global bypass; APPLY
+        axil_write_aw_then_w(16'h0008,32'h00000000,4'b1111); // un-bypass all channels
+        axil_write_aw_then_w(16'h0000,32'h00000000,4'b0001); // enable filter path
+
+        check_active_sample(48'h123_456_789_abc);
+        check_active_sample(48'hfff_800_001_555);
+        check_active_sample(48'h000_111_eee_7ff);
 
         if(errors==0) $display("TB_PD_FILTER_CHAIN_PASS");
         else $fatal(1,"TB_PD_FILTER_CHAIN_FAIL errors=%0d",errors);

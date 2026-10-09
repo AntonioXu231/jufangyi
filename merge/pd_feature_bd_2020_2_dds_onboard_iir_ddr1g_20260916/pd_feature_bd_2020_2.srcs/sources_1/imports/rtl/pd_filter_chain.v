@@ -3,7 +3,7 @@
 // W independently; reset defaults to a bit-exact external bypass.
 module pd_filter_chain #(
     parameter integer NUM_CH=4, ADC_W=12, DW=16, CW=18, FW=16,
-    parameter integer N_BP=1, N_NT=0, CLK_HZ=130000000, SAMPLE_HZ=26000000,
+    parameter integer N_BP=1, N_NT=0, CLK_HZ=130000000, SAMPLE_HZ=65000000,
     parameter integer C_S_AXI_DATA_WIDTH=32, C_S_AXI_ADDR_WIDTH=16
 )(
     (* X_INTERFACE_PARAMETER = "XIL_INTERFACENAME CLK, FREQ_HZ 130000000, ASSOCIATED_BUSIF S_AXI" *)
@@ -73,6 +73,10 @@ module pd_filter_chain #(
     wire c_valid=(c_ch<NUM_CH)&&(c_stage<N_STAGE)&&(c_reg<=5);
     wire [4:0] c_idx=c_ch*N_STAGE+c_stage; wire [7:0] c_base=(c_ch*N_STAGE+c_stage)*5;
     integer i;
+    initial begin
+        if ((CLK_HZ % SAMPLE_HZ) != 0 || (CLK_HZ / SAMPLE_HZ) < 2)
+            $error("pd_filter_chain requires an integer CLK_HZ/SAMPLE_HZ ratio of at least 2");
+    end
     always @(posedge clk or negedge rst_n) begin
         if(!rst_n) begin aw_hold<=0; w_hold<=0; bvalid<=0; cfg_valid<=0; awaddr_hold<={C_S_AXI_ADDR_WIDTH{1'b0}}; wdata_hold<=32'd0; wstrb_hold<=4'd0; cfg_addr<=12'd0; cfg_data<=32'd0; cfg_strb<=4'd0; end
         else begin
@@ -108,7 +112,7 @@ module pd_filter_chain #(
         wire signed [DW-1:0] sd[0:N_STAGE]; wire sv[0:N_STAGE]; assign sd[0]=in_s; assign sv[0]=adc_dv[ch];
         for(st=0;st<N_STAGE;st=st+1) begin: GST
             localparam integer CI=ch*N_STAGE+st, CB=CI*5;
-            pd_iir_biquad #(.DW(DW),.CW(CW),.FW(FW),.PH(5)) u_iir(.clk(clk),.rst_n(rst_n),.clr(cfg_clr),.dv(sv[st]),.din(sd[st]),.c_b0(ac_en[CI]?ac_coef[CB]:ONE_C),.c_b1(ac_en[CI]?ac_coef[CB+1]:ZERO_C),.c_b2(ac_en[CI]?ac_coef[CB+2]:ZERO_C),.c_a1(ac_en[CI]?ac_coef[CB+3]:ZERO_C),.c_a2(ac_en[CI]?ac_coef[CB+4]:ZERO_C),.dout(sd[st+1]),.dout_dv(sv[st+1]));
+            pd_iir_biquad #(.DW(DW),.CW(CW),.FW(FW),.PH(2)) u_iir(.clk(clk),.rst_n(rst_n),.clr(cfg_clr),.dv(sv[st]),.din(sd[st]),.c_b0(ac_en[CI]?ac_coef[CB]:ONE_C),.c_b1(ac_en[CI]?ac_coef[CB+1]:ZERO_C),.c_b2(ac_en[CI]?ac_coef[CB+2]:ZERO_C),.c_a1(ac_en[CI]?ac_coef[CB+3]:ZERO_C),.c_a2(ac_en[CI]?ac_coef[CB+4]:ZERO_C),.dout(sd[st+1]),.dout_dv(sv[st+1]));
         end
         wire signed [DW-1:0] y=sd[N_STAGE]; wire signed [ADC_W-1:0] yc=(y>2047)?2047:(y< -2048)?-2048:y[ADC_W-1:0]; wire bypass=fctrl_bypass|bypass_mask[ch];
         assign filt_data[ch*ADC_W+:ADC_W]=bypass?raw:(yc+(1<<(ADC_W-1)));

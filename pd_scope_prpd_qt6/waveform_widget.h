@@ -20,12 +20,15 @@ public:
     void setSingleFrameMode(bool enabled);
     void setTraceColor(const QColor &color);
     void resetZoom();
+    WidgetPaintMetrics takePaintMetrics();
 
 protected:
     void paintEvent(QPaintEvent *event) override;
     void wheelEvent(QWheelEvent *event) override;
 
 private:
+    bool expirePulses(qint64 nowMs);
+
     struct PulseVisual {
         PdPulse pulse;
         qint64 createdMs = 0;
@@ -51,4 +54,5 @@ private:
     bool m_fullCycleEnvelope = false;
     quint32 m_sourceSampleCount = 0;
     double m_eventThreshold = 0.0;
+    WidgetPaintMetrics m_paintMetrics;
 };

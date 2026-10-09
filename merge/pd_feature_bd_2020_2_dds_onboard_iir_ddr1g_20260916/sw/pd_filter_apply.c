@@ -17,8 +17,8 @@
 #define COEF_STRIDE 0x004U
 #define FILTER_VERSION 0x04U
 
-/* 26 MSPS, 100 kHz..1 MHz, Q1.16 values in the low 18 bits. */
-static const unsigned coef[5] = { 0x01916U, 0x00000U, 0x3E6EAU, 0x23385U, 0x0CDD4U };
+/* 65 MSPS, 100 kHz..1 MHz, Q1.16 values in the low 18 bits. */
+static const unsigned coef[5] = { 0x00AACU, 0x00000U, 0x3F554U, 0x21592U, 0x0EAA9U };
 
 static int check(unsigned off, unsigned expect)
 {
@@ -40,10 +40,10 @@ static int safe_bypass(void)
 int main(void)
 {
     unsigned ch, i, off, status;
-    xil_printf("--- pd_filter_apply 26 MSPS ---\r\n");
+    xil_printf("--- pd_filter_apply 65 MSPS ---\r\n");
 
     if (!safe_bypass()) return XST_FAILURE;
-    if (Xil_In32(FILTER_BASE + FSAMPLE_HZ) != 26000000U) {
+    if (Xil_In32(FILTER_BASE + FSAMPLE_HZ) != 65000000U) {
         xil_printf("FAIL: unexpected sample rate\r\n");
         return XST_FAILURE;
     }

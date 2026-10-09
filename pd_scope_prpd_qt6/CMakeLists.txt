@@ -19,6 +19,7 @@ qt_add_executable(pd_scope_prpd_qt6
     event_table_model.h event_table_model.cpp
     fft_widget.h fft_widget.cpp
     single_channel_page.h single_channel_page.cpp
+    single_phase_page.h single_phase_page.cpp
 )
 
 target_link_libraries(pd_scope_prpd_qt6 PRIVATE Qt6::Widgets Qt6::Network)

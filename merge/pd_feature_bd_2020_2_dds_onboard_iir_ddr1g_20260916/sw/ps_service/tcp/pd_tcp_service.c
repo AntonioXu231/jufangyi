@@ -1,4 +1,4 @@
-/* TCP API 17 front end; acquisition remains owned by pd_acquisition_core. */
+/* TCP API 18 front end; acquisition remains owned by pd_acquisition_core. */
 #include "pd_tcp_service.h"
 #include "pd_acquisition.h"
 #include "pd_hw_map.h"
@@ -34,7 +34,7 @@
 #define PD_SCOPE_ENV_BINS        1024U
 #define PD_SCOPE_ENV_CHANNELS    4U
 #define PD_SCOPE_ENV_BYTES       (PD_SCOPE_ENV_BINS * PD_SCOPE_ENV_CHANNELS * 4U)
-#define PD_SCOPE_CYCLE_SAMPLES   520000U
+#define PD_SCOPE_CYCLE_SAMPLES   (PD_SPECTRUM_DEFAULT_FS_HZ / 50U)
 #define PD_SCOPE_ENV_STEP_SAMPLES 32768U
 #define PD_SCOPE_PEAK_BATCH_MAX_PACKETS 32U
 #define PD_SCOPE_PEAK_BATCH_BYTES       131072U

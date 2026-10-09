@@ -47,7 +47,7 @@ if {[llength [get_bd_cells -quiet pd_filter_0]] == 0} {
 }
 foreach {key value} {
     CONFIG.NUM_CH 4 CONFIG.ADC_W 12 CONFIG.DW 16 CONFIG.CW 18 CONFIG.FW 16
-    CONFIG.N_BP 2 CONFIG.N_NT 6 CONFIG.CLK_HZ 130000000 CONFIG.SAMPLE_HZ 26000000
+    CONFIG.N_BP 2 CONFIG.N_NT 6 CONFIG.CLK_HZ 130000000 CONFIG.SAMPLE_HZ 65000000
     CONFIG.C_S_AXI_DATA_WIDTH 32 CONFIG.C_S_AXI_ADDR_WIDTH 16
 } {
     catch {set_property $key $value [get_bd_cells pd_filter_0]}

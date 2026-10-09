@@ -21,11 +21,13 @@ public:
     void setSnapshotCatalog(quint64 first, quint64 next, quint32 state);
     void returnToLiveView();
     void resetZoom();
+    WidgetPaintMetrics takeWaveformPaintMetrics();
 
 signals:
     void channelSelected(int channel);
     void snapshotCatalogRequested();
     void snapshotFftRequested(quint32 sequence, int channel, quint32 startSample);
+    void fullSnapshotRequested(quint32 sequence, int channel, quint32 startSample);
 
 private slots:
     void refreshSelectedChannel();

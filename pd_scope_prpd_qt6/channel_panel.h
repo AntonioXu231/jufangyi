@@ -1,11 +1,11 @@
 #pragma once
 
 #include "scope_types.h"
+#include "waveform_widget.h"
 
 #include <QWidget>
 
 class QLabel;
-class WaveformWidget;
 class PhaseEllipseWidget;
 
 class ChannelPanel final : public QWidget
@@ -23,6 +23,8 @@ public:
     void clearPhaseEvents();
     void setPhaseEventThreshold(double rawAdc);
     void resetZoom();
+    WidgetPaintMetrics takeWaveformPaintMetrics();
+    WidgetPaintMetrics takePhasePaintMetrics();
 
 private:
     int m_channel;

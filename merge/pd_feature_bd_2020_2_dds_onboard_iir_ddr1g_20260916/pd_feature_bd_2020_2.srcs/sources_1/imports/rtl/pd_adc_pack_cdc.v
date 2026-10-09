@@ -6,7 +6,7 @@ module pd_adc_pack_cdc #(
     parameter integer ADC_W      = 12,
     parameter integer DEPTH      = 256,
     parameter integer CLK_HZ     = 130000000,
-    parameter integer SAMPLE_HZ  = 26000000
+    parameter integer SAMPLE_HZ  = 65000000
 )(
     input  wire                         adc_clk,
     input  wire                         clk,

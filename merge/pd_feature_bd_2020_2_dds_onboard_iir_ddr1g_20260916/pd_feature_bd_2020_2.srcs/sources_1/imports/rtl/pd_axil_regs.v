@@ -79,7 +79,7 @@ module pd_axil_regs #(
     parameter integer NUM_CH             = 4,
     parameter integer PH_W               = `PD_PH_W,
     parameter integer VERSION            = 32'h0003_0000,
-    parameter integer SAMPLE_HZ          = 26000000
+    parameter integer SAMPLE_HZ          = 65000000
 )(
     // ================= AXI4-Lite Slave =================
     input  wire                          S_AXI_ACLK,

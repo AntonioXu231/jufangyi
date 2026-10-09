@@ -8,6 +8,21 @@ typedef struct {
     s32 im;
 } pd_complex_q15_t;
 
+/* Keep ADC-code precision through the ten per-stage FFT right shifts. */
+#define PD_FFT_INPUT_SCALE_BITS 8U
+#define PD_FFT_INPUT_SCALE      (1U << PD_FFT_INPUT_SCALE_BITS)
+#define PD_FFT_INPUT_SCALE_SQ   (1ULL << (2U * PD_FFT_INPUT_SCALE_BITS))
+
+static u32 isqrt_u64(u64 value);
+
+static u32 fft_single_sided_peak_code(u64 power, u32 bin)
+{
+    /* Nyquist is an endpoint and does not receive the ordinary x2 correction. */
+    const u32 one_sided_gain = (bin == (PD_FFT_POINTS / 2U)) ? 2U : 4U;
+    const u32 scaled = isqrt_u64(power) * one_sided_gain;
+    return (scaled + (PD_FFT_INPUT_SCALE / 2U)) >> PD_FFT_INPUT_SCALE_BITS;
+}
+
 /* sin(pi*n/512), n=0..256, in Q15.  Quadrant mapping yields sin(2*pi*n/1024). */
 static const s16 s_sin_quarter_q15[257] = {
      0, 201, 402, 603, 804, 1005, 1206, 1407, 1608, 1809, 2009, 2210, 2410, 2611, 2811, 3012,
@@ -143,7 +158,8 @@ int pd_spectrum_analyze(const void *raw, u32 bytes, u32 start_sample,
 
         for (i = 0U; i < PD_FFT_POINTS; ++i) {
             (void)pd_snapshot_read_sample(raw, bytes, start_sample + i, sample);
-            data[i].re = q15_mul((s32)sample[channel] - dc, hann_q15(i));
+            data[i].re = q15_mul(((s32)sample[channel] - dc) *
+                                 (s32)PD_FFT_INPUT_SCALE, hann_q15(i));
             data[i].im = 0;
         }
         fft_forward(data);
@@ -154,7 +170,7 @@ int pd_spectrum_analyze(const void *raw, u32 bytes, u32 start_sample,
             power = (u64)((s64)data[bin].re * data[bin].re) +
                     (u64)((s64)data[bin].im * data[bin].im);
             band_power += power;
-            amplitude = (s32)isqrt_u64(power) * 4;
+            amplitude = (s32)fft_single_sided_peak_code(power, bin);
             if ((u32)amplitude > peak_amplitude) {
                 peak_amplitude = (u32)amplitude;
                 peak_bin = bin;
@@ -164,7 +180,10 @@ int pd_spectrum_analyze(const void *raw, u32 bytes, u32 start_sample,
         result->channel[channel].peak_hz =
             (u32)(((u64)peak_bin * sample_rate_hz) / PD_FFT_POINTS);
         result->channel[channel].amplitude_code = peak_amplitude;
-        result->channel[channel].band_power = band_power;
+        /* Keep this relative metric in its pre-Q8 public scale. */
+        result->channel[channel].band_power =
+            (band_power + (PD_FFT_INPUT_SCALE_SQ / 2U)) /
+            PD_FFT_INPUT_SCALE_SQ;
     }
     return XST_SUCCESS;
 }
@@ -198,7 +217,8 @@ int pd_spectrum_analyze_channel(const void *raw, u32 bytes, u32 start_sample,
     dc = (s32)(sum / PD_FFT_POINTS);
     for (i = 0U; i < PD_FFT_POINTS; ++i) {
         (void)pd_snapshot_read_sample(raw, bytes, start_sample + i, sample);
-        data[i].re = q15_mul((s32)sample[channel] - dc, hann_q15(i));
+        data[i].re = q15_mul(((s32)sample[channel] - dc) *
+                             (s32)PD_FFT_INPUT_SCALE, hann_q15(i));
         data[i].im = 0;
     }
     fft_forward(data);
@@ -209,7 +229,7 @@ int pd_spectrum_analyze_channel(const void *raw, u32 bytes, u32 start_sample,
         power = (u64)((s64)data[bin].re * data[bin].re) +
                 (u64)((s64)data[bin].im * data[bin].im);
         band_power += power;
-        amplitude = isqrt_u64(power) * 4U;
+        amplitude = fft_single_sided_peak_code(power, bin);
         if (bins != 0) bins[bin] = amplitude > 0xFFFFU ? 0xFFFFU : (u16)amplitude;
         if (amplitude > peak_amplitude) {
             peak_amplitude = amplitude;
@@ -220,7 +240,8 @@ int pd_spectrum_analyze_channel(const void *raw, u32 bytes, u32 start_sample,
     result->peak_bin = peak_bin;
     result->peak_hz = (u32)(((u64)peak_bin * sample_rate_hz) / PD_FFT_POINTS);
     result->amplitude_code = peak_amplitude;
-    result->band_power = band_power;
+    result->band_power = (band_power + (PD_FFT_INPUT_SCALE_SQ / 2U)) /
+                         PD_FFT_INPUT_SCALE_SQ;
     return XST_SUCCESS;
 }
 

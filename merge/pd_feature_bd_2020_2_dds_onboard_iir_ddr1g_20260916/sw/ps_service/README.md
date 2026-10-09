@@ -28,11 +28,12 @@ TCP 前端新增以下不改动 PL 的运行时命令：
 - `SET LIMIT n`：仅空闲时设置后续无参数 `START` 的默认包数；`n=0` 表示连续采集，配置仅在当前上电会话内保持。
 - `SCOPE ON [samples]` / `SCOPE NEXT` / `SCOPE FFT CHANNEL n`（`n=0..3`）/ `SCOPE EVENT SEQ seq [samples [channel evt_seq]]` / `SCOPE OFF`：实时示波器协议。PS 从 PL 原始 DDR 环形缓冲中读取一个最新窗口（默认 1024 个四通道 48-bit 样本），以 `SCOPE V1` 二进制帧推送给 Qt；`SCOPE FFT CHANNEL n` 对最近一次 `SCOPE NEXT` 的同一帧在 PS 上去直流、加 Hann 窗并执行 1024 点固定点 FFT，返回 513 个单边幅值码（u16 little-endian，CRC32 覆盖负载）及主峰/频率/帧序号。Qt 当前单通道实时页已解析并绘制 `SCOPE_FFT V1`，校验帧序号、通道、长度和 CRC。为兼容旧客户端，简写 `SCOPE FFT n` 仍可用。`SCOPE EVENT SEQ` 可以附加通道与事件字序号，避免从同一事件记录中误选另一通道/另一脉冲；PS 再按该脉冲的相位在最新完整快照中提取候选窗口并以 `SCOPE V2` 推送。快照记录没有与事件周期/样本时间戳关联字段，因此即使事件字选择精确，也不能保证候选快照窗口包含同一个瞬态脉冲。帧头公开 `snap_seq/event_seq/event_channel/event_word_seq/start/center/phase` 供诊断。仅在采集运行时允许这些命令，`samples` 必须为 256..2048 且是 4 的倍数；实时 FFT 要求 `SCOPE ON 1024`，以确保频谱覆盖与该 SCOPE 帧相同的整帧。
 - `START`：不带参数时采用 `SET LIMIT` 保存的默认值；`START n` 始终以显式 `n` 为准。
-- `FFT BINS SNAP SEQ seq CHANNEL ch START sample`：在 IDLE 状态从指定完整快照中选择一个通道和 1024 点窗口，由 PS 计算去直流/Hann FFT，并返回 `FFT_SNAP_BINS_V1` + 513 个 little-endian u16 幅值 bin + CRC32。此接口不是对 520,000 点直接做超长 FFT；`start` 明确标出 1024 点窗口在完整波形中的位置。
+- `FFT BINS SNAP SEQ seq CHANNEL ch START sample`：在 IDLE 状态从指定完整快照中选择一个通道和1024点窗口，由PS计算去直流/Hann FFT，并返回`FFT_SNAP_BINS_V1`+513个little-endian u16幅值bin+CRC32。65 MSPS、50 Hz周期长度为1,300,000点；`start`明确标出FFT窗口在完整波形中的位置。
+- `FFT FULL SNAP SEQ seq CHANNEL ch START sample`：IDLE状态分块发送指定SNAP中选定通道的全部1,300,000个中心化signed16点，并附由PS计算的同一SNAP/通道/起点1024点、513-bin FFT。头内`sample_bytes=2600000`、`bins_bytes=1026`，CRC32覆盖整个负载；这是人工查看接口，不用于实时轮询。
 
 > 当前 `CONFIG` 能力字段还包含 `snap_fft=ps_q15_1024x1x1_bins513`；未更新的历史固件没有该字段，也不支持上面的二进制 bins 命令。
 
-> 范围说明：Qt 单通道页消费实时 `SCOPE_FFT V1`，也可对已载入的静态 SNAP 指定通道和起点请求 PS FFT bins。静态频谱是该快照中一个 1024 点窗口的 FFT，不是对 520,000 点整周期直接做一次超长 FFT。`SCOPE EVENT SEQ` 可按 record/channel/evt_seq 选择确切事件字，但快照无同周期/采样时间戳，因此对应波形窗仍是相位近似候选，不是严格的同一瞬态关联。
+> 范围说明：Qt单通道页可查看实时1024点短帧，也可手动读取完整四通道SNAP；全部1,300,000点保留在Qt内存，按屏幕像素绘制min/max。PS频谱仍是指定起点的1024点FFT，Qt不执行FFT。`SCOPE EVENT SEQ`可精确选择归档事件字，但快照尚无共同周期/采样时间戳，不能证明候选波形窗包含同一次物理脉冲。
 - `RECOVER`：仅 `FAULT` 状态有效。服务会关闭新触发、等待正在进行的 PL 拷贝结束、逐槽锁定并释放仍未归档的硬件快照、清除槽状态并复位 S2MM DMA。已归档到 PS DDR 的事件与快照不受影响；回复中的 `discarded_slots` 是明确丢弃的硬件槽数。
 - `CATALOG`：返回当前 PS DDR 环形归档的保留序号窗口，区间是半开区间 `[first,next)`。
 - `EVENT SEQ n`、`SNAP SEQ n`：按单调 sequence 查询归档元数据；若记录已被环形覆盖，会明确返回错误。旧的 `EVENT index`、`SNAP index` 仍保留以兼容已有 PowerShell 下载工具。
@@ -72,18 +73,18 @@ ANALYZE SNAP 0
 ANALYZE SNAP SEQ 8
 ```
 
-返回的每个通道三元组为 `min/max/mean`。当前 3,120,000-byte 快照必须报告 `samples=520000`。该命令仅从 PS DDR 归档读数据，不修改归档、滤波或 PL；它是进入 PS 侧窗口、滤波和 FFT 前的格式一致性门槛。
+返回的每个通道三元组为 `min/max/mean`。65 MSPS 配置下，一个 50 Hz 周期快照为 7,800,000 bytes，必须报告 `samples=1300000`。该命令仅从 PS DDR 归档读数据，不修改归档、滤波或 PL；它是进入 PS 侧窗口、滤波和 FFT 前的格式一致性门槛。
 
 ## PS-7：去直流、Hann 窗与 1024 点 FFT
 
-`include/pd_spectrum.h` 与 `src/pd_spectrum.c` 提供四通道顺序定点 FFT：每通道在所选 1024 样本窗口中先计算均值并去直流，再施加周期 Hann 窗，随后运行带每级缩放的 radix-2 前向 FFT。扫描范围为 `bin 1..512`，因此 DC 不可能被误报为主峰。输出的 `amplitude_code` 已按 Hann 的相干增益近似校正，可用于同一采样率、同一配置下的相对幅值比较。
+`include/pd_spectrum.h`与`src/pd_spectrum.c`提供四通道顺序定点FFT：每通道先去均值、加周期Hann窗，输入内部提升8位有效精度后运行逐级归一化radix-2 FFT；幅值输出再还原到ADC码尺度。普通单边bin做Hann相干增益校正，Nyquist端点单独归一化，DC不参与主峰。相对`band_power`维持原公开比例。非物理标定频谱仍需与MATLAB高精度结果比对。
 
 TCP 命令：
 
 ```text
 FFT SELFTEST
 FFT CONFIG
-SET FFTFS 26000000
+SET FFTFS 65000000
 FFT SNAP 0
 FFT SNAP 0 4096
 FFT SNAP SEQ 8 4096
@@ -91,7 +92,7 @@ FFT AUTO SNAP 0
 FFT AUTO SNAP SEQ 8
 ```
 
-`FFT SELFTEST` 生成四路已知主峰（bin `37/83/151/255`）并穿过同一条“打包—解包—去直流—加窗—FFT—主峰”路径；只有返回 `FFT_SELFTEST_PASS` 才进入真实快照分析。`FFT SNAP` 只允许空闲状态执行。默认采样率是当前 DDS 原型的 26 MSPS（bin 分辨率约 25.39 kHz）；将来切换到 65 MSPS 时无需改动 FFT 内核，只需在空闲状态执行 `SET FFTFS 65000000`，此时频率分辨率约为 63.48 kHz。
+`FFT SELFTEST` 生成四路已知主峰（bin `37/83/151/255`）并穿过同一条“打包—解包—去直流—加窗—FFT—主峰”路径；只有返回 `FFT_SELFTEST_PASS` 才进入真实快照分析。`FFT SNAP` 只允许空闲状态执行。65 MSPS 版本默认采样率为 65 MSPS，1024 点 FFT 的频率分辨率约为 63.48 kHz；如需临时覆盖，可在空闲状态执行 `SET FFTFS hz`。该设置只影响 PS 的频率换算，必须与 PL 实际采样时钟一致。
 
 `FFT AUTO SNAP` 为事件快照选择共同分析窗口：它扫描整段快照，以四通道中相对 `0x800` 偏离最大的原始样本为事件点，选择以该点为中心的 1024 点窗口后再执行同一 FFT 链。回复中 `event=sample/channel/raw_code/delta_from_mid` 明确给出窗口选择依据。这对触发事件不位于快照第一个 1024 点内的情况尤为必要。
 
@@ -238,7 +239,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 - `tools/pd_ps_final_regression.ps1`：在一个独立 TCP 会话里覆盖 FFT 自检、采集、目录、事件包解码、批量扫描、特征、告警和统一报告；
 - `TCP_API_v10_冻结说明.md`：固定当前命令、字段、二进制 `GET` 纪律和环形覆盖语义，作为未来上位机的接口输入。
 
-当前 Vitis 应用还需要纳入新增的 `pd_event_decode.c`。已经同步的活动工程 `F:\ps\lwip_echo_server\src\CMakeLists.txt` 已添加：
+当前Vitis应用为`F:\ps\lwip_echo_server10\src`，活动平台为`F:\ps\platform5`。构建脚本目标已切换到此应用/平台；重新构建时会检查实际`-O2`编译选项。
 
 ```cmake
 collect (PROJECT_LIB_SOURCES pd_event_decode.c)
@@ -253,35 +254,37 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 如需在测试后清理 PS 元数据（原始 PL DDR 不受影响），追加 `-ClearAtEnd`。运行前必须下载 `CONFIG api=11` 的 ELF。
 
-## API 16：完整 PL 事件包、PS 实时 FFT 与整周期包络（API 17 的基础协议）
+## 当前 API 18：完整快照读取、逐包相位元数据与事件追赶
 
-> Qt 状态（2026-10-08）：API 17 单通道页消费实时 `SCOPE_FFT V1`、归档同窗 `FFT_SNAP_WAVE_V1` 与 `SCOPE_ENV V1`，校验元数据和 CRC 后绘图；当前源码仍待用户构建/联板验证。`SCOPE_ENV` 是 1024 列 min/max 压缩预览，不替代完整 SNAP 原始点。下文较早 API 草稿中“Qt 尚未解析 SCOPE_FFT”是历史状态。
+> Qt状态（API 18）：单通道页消费实时`SCOPE_FFT V1`、归档同窗`FFT_SNAP_WAVE_V1`和`SCOPE_ENV V1`；新增的`FFT FULL SNAP`可分块读取完整原始SNAP，Qt把四路点按像素列作min/max绘图。用户仍需构建PS/Qt并在板上验收。`SCOPE_ENV`继续作为1024列快速预览。
 
-本节覆盖上文历史 API 说明中关于 `SCOPE PEAKS` 抽取峰值或仅有 16 个事件归档槽的表述。当前基准代码把事件归档扩为 2048 × 64 KiB（DDR `0x27000000` 至 `0x2EFFFFFF`）；快照归档止于 `0x26FFFFFF`，两者不重叠。`SCOPE PEAKS` 返回 `PEAKS V2`，传送一个归档包的全部 64-bit 字，包括每个峰值和周期字，CRC32 覆盖完整负载，不进行 256 峰值抽取。归档游标超出保留窗口时，回复中的 `gap` 为本次跳过包数，`skipped` 为本会话累计跳过包数；坏包也计入 `skipped`。新增的 `SCOPE FFT channel` 对最近 `SCOPE NEXT` 帧执行 PS 端 1024 点固定点 FFT，只返回所选通道的 513 点幅值谱；响应 `SCOPE_FFT V1` 中 `seq` 必须与该波形帧 `seq` 相同，二进制负载为 513 个 u16 little-endian 幅值码并由 CRC32 校验。
+本节覆盖上文历史 API说明中关于`SCOPE PEAKS`抽取峰值或仅有16个事件归档槽的表述。当前事件归档为2048×64KiB；`SCOPE PEAKS`返回`PEAKS V4`及完整64-bit事件字，包头的wins/lock来自该包归档时保存的元数据。`SCOPE PEAKS BATCH 32`的V4二进制记录头为28字节：`sequence:u32, bytes:u32, lock_mask:u32, wins[4]:u32`，后跟原事件字；CRC32覆盖所有记录头与事件字。归档游标超出保留窗口时，`gap`为本次跳过包数，`skipped`为本会话累计跳过数。`SCOPE FFT CHANNEL`仍对最近1024点实时帧由PS计算。
 
-新增 `SCOPE ENVELOPE` 用于上位机整周期示波与相位图：它查找最新归档快照，要求负载为 520,000 个采样时刻 × 每时刻 6 字节（四路 12-bit ADC 打包），并从 DDR 逐样本归约为 1,024 个相位列。每列、每通道输出 `min:s16, max:s16` 两个 little-endian 16-bit 值，列序为相位递增、列内通道 0..3，固定负载 16,384 字节；头格式为 `SCOPE_ENV V1 seq=... snap_seq=... samples=520000 bins=1024 bytes=16384 fs=26000000 lock=... phase=cycle_start crc32=...`。CRC32 覆盖完整 16,384 字节。若无完整快照，返回 `SCOPE_ENV NONE reason=not_ready`；处理期间快照被四槽环覆盖，则返回 `SCOPE_ENV SKIP reason=snapshot_overwritten`。归约按最多 32,768 个采样/轮询步分片，避免在 lwIP 命令回调中一次性长时间占用 CPU。快照的相位列成立条件是 PL 环形缓存确实以 `cycle_start` 周期边界冻结；`lock` 位掩码表示各通道当前 PL 锁相状态，Qt 端必须结合该掩码判定相位是否有效。
+新增`SCOPE ENVELOPE`用于整周期预览：65 MSPS下从PS归档读取1,300,000×6字节，按相位归约1024列，每列每通道返回min/max，固定负载16384字节并由CRC32保护。扫描期间固定当前PS归档槽；若下一快照将覆盖该槽，PS释放新硬件槽并增加`snap_pin_drop`，事件DMA仍可继续。未找到完整周期时返回`SCOPE_ENV NONE`；`SCOPE_ENV SKIP`保留为检测到意外覆盖/记录失效时的异常。归约每轮最多处理32768个采样时刻。锁相掩码目前是启动本次归约时读取的PL状态，尚非快照逐采样附带的历史锁相轨迹。
 
 Vitis 应用至少同步 `include/pd_acquisition.h`、`include/pd_spectrum.h`、`src/pd_spectrum.c`、`tcp/pd_tcp_service.c`，并保持 `include/pd_hw_map.h` 与基准目录一致。全周期归约能力在 `tcp/pd_tcp_service.c` 中；若应用的其余模块已与本目录版本一致，本次只需替换该文件。只更新 Qt 而不更新板端 ELF 不会得到完整事件流、PS 实时 FFT 或整周期包络。构建和下载由使用者在 Vitis 执行；本次修改未重新运行硬件验收。
 
-验收前须先用独立 TCP 客户端发送 `CONFIG`，核对当前 API/能力字段；API 17 另包含 `scope_peaks_batch=32` 和 `snap_fft_wave=ps_q15_1024x1_samples_plus_bins`。随后可运行 `START 0`、`SCOPE ON 1024`、`SCOPE ENVELOPE`；必须按 ASCII 头声明长度读取二进制并校验 CRC。`SCOPE PEAKS BATCH 32` 返回完整批量事件字，`gap`、`skipped` 与 Qt 序号缺口仍需为 0 才能声称无观测到的传输损失。归档 FFT 命令要求 IDLE，Qt 会短暂停采后恢复；若要求无间断记录，不应在正式采集时触发归档分析。
+验收前先发送`CONFIG`并确认`api=18`、`snap_full=raw6b_1300000`、`event_meta=per_packet_v1`和`scope_peaks_batch=32`。PEAKS V4的批次每个包头增加lock mask及四通道phase_win，二进制记录头28字节，后跟原事件字；CRC覆盖全部内容。完整SNAP读取要求IDLE，会暂停采集，分块读取后计算PS FFT并恢复。事件链路仍需在规定负载下确认gap/skipped不增长。
 
-## API 17：批量事件追赶与归档同窗 PS FFT
+包络任务开始时会固定当前PS归档快照，扫描完成、客户端断开或`SCOPE OFF`时释放。若新硬件快照要写入正被扫描的PS归档槽，PS释放该硬件槽并累加`STATUS snap_pin_drop`，不覆盖读取中的SNAP；事件DMA归档仍继续。该计数表示为保持包络一致性而让出的快照数，不应与`PS事件跳过`混为一谈，也不保证每个硬件SNAP都进入PS归档。
 
-`SCOPE PEAKS BATCH 32` 一次传回最多 32 个完整事件归档包，以减少逐包 TCP 请求往返。`PEAKS V3` 头中的 `packets/peaks/bytes/gap/skipped` 描述本批次和累计状态；二进制负载按顺序由 `{sequence:u32 LE, bytes:u32 LE, raw event words}` 记录组成，CRC32 覆盖整个批次。此协议不抽取峰值，也不会掩盖环形槽覆盖：`gap`、`skipped` 必须保持为零才算本次连续接收无缺口。
+## 历史 API 17：批量事件追赶与归档同窗 PS FFT
+
+`SCOPE PEAKS BATCH 32`一次返回最多32个完整事件归档包；`PEAKS V4`头含`packets/peaks/bytes/gap/skipped`。二进制记录按顺序为`{sequence:u32 LE, bytes:u32 LE, lock_mask:u32 LE, wins[4]:u32 LE, raw event words}`，CRC32覆盖整个批次。此协议不抽取峰值，也不会掩盖环形槽覆盖：`gap`、`skipped`须为0才表示本次连续接收无包序号缺口。
 
 API 17 另外把 TCP 传输单次写入上限从 1 KiB 提至 4 KiB，但每次仍受实时 `tcp_sndbuf()` 限制；CRC32 改用等价的 4-bit 查表路径，包络归约对四通道展开比较、移除逐采样内层通道循环。包络分片预算仍为 32,768 个采样/轮询步，没有用降低刷新率换取事件吞吐。优化效果须通过同一 DDS 负载下的 `gap/skipped`、硬件 `drops`、包络 `SKIP` 与实际刷新率对比确认。
 
 `FFT WAVE SNAP SEQ seq CHANNEL ch START sample` 仅允许在 `IDLE` 执行。PS 在同一完整 SNAP、通道与起点上生成 1024 个有符号 ADC 波形样本和 513 个单边频谱 bin，作为一个 `FFT_SNAP_WAVE_V1` 二进制负载返回；CRC32 同时保护波形和频谱。Qt 的归档 FFT 操作会显式发送 `SCOPE OFF`、`STOP` 并轮询 `STATUS` 至 `IDLE`，完成读取后自动重新 `START 0`/`SCOPE ON 1024`。这会造成一次短暂停采，因此该按钮用于归档诊断，不应用于要求绝对无间断的采集时段。
 
-API 17 `CONFIG` 应包含 `scope_peaks_batch=32` 与 `snap_fft_wave=ps_q15_1024x1_samples_plus_bins`。本次代码修改后仍需用户在 Vitis 重建 ELF，并在板上实测批量包序、完整负载 CRC、归档窗口匹配及停止/恢复流程；尚未由本地静态核对替代硬件验收。
+历史API 17的`CONFIG`包含`scope_peaks_batch=32`与`snap_fft_wave=...`；当前API 18另外声明`snap_full`和`event_meta`。需重建实际app10 ELF并实测批次CRC、完整快照及停止/恢复流程。
 
 ### Vitis PS 优化级别
 
-520,000 点包络归约和事件批量打包属于 PS 热循环。Vitis Unified 应用的 `src/UserConfig.cmake` 若仍设置 `USER_COMPILE_OPTIMIZATION_LEVEL -O0`，生成命令会在 BSP 的 `-O2` 后追加 `-O0`，最终以 `-O0` 编译。本应用应设为 `-O2`（保留 `-g3` 调试信息即可）；重新 Build 后在 `compile_commands.json` 确认 `pd_tcp_service.c` 的最终优化选项是 `-O2`，再下载 ELF 测量 `SKIP/gap/drops`。优化编译不是零丢失证明，仍需板上压力验收。
+1,300,000点周期包络归约和事件批量打包属于PS热循环。当前Vitis应用 `F:\ps\lwip_echo_server10` 的 `src/UserConfig.cmake` 已设为 `-O2`；`tools/build_vitis_app_direct.ps1` 会检查 `pd_tcp_service.c` 和 `pd_spectrum.c` 的最终优化选项。重新Build并下载新的ELF后，仍需板测 `SKIP/gap/drops`；优化编译本身不证明零丢失。
 
 ### Vitis 2024.1 平台任务已结束但 app 未构建
 
-`F:\ps` 工作区在 2026-10-08 的日志中多次显示 `platform4` 后端 `status_code:0`、`Platform Build Finished successfully`，但 IDE 的任务开始记录可能晚于完成/停止通知，界面仍显示平台进度。此时检查 `F:\ps\logs\ide_verbose.log` 的同一任务 ID 与 `F:\ps\platform4\export\.buildstatus`，不要把界面标签当作 BSP 仍在运行。`lwip_echo_server9` 的 `.elf` 若不存在、`build/.ninja_log` 未更新，说明 app 编译尚未执行。
+`platform4/lwip_echo_server9` 是历史应用。当前工程使用 `F:\ps\platform5` 和 `F:\ps\lwip_echo_server10`；2026-10-09 Vitis日志记录platform5成功生成、app10 ELF构建并下载。诊断当前构建时必须查看同一目录下的 `build.ninja`、`compile_commands.json`、ELF时间戳和对应的Vitis任务日志，不能用旧server9/platform4状态代表当前版本。
 
 当前 app 的 TCP 服务只应从 `src/pd_tcp_service.c` 生成一个对象，其七个 `src/modules/**/*.inc` 由该文件包含，不单独编译。Vitis 可能在 `src/CMakeLists.txt` 重复写入同一条本地源路径；以重新生成的 Ninja 图里只有一个 TCP 服务对象为准，不能引用 `../pd_tcp_service.c`。运行前先关闭 Vitis，以免两个进程同时写同一 build 目录；只读预检和实际构建分别为：
 
@@ -290,12 +293,12 @@ API 17 `CONFIG` 应包含 `scope_peaks_batch=32` 与 `snap_fft_wave=ps_q15_1024x
 & 'F:\xinya\v5\merge\pd_feature_bd_2020_2_dds_onboard_iir_ddr1g_20260916\sw\ps_service\tools\build_vitis_app_direct.ps1'
 ```
 
-预检应输出 `PS_APP_BUILD_CHECK_PASS`；实际构建应输出 `PS_APP_BUILD_PASS` 并生成 `F:\ps\lwip_echo_server9\build\lwip_echo_server9.elf`。脚本只构建现有 app，Vitis 的 Ninja 会因 `src/CMakeLists.txt` 比 `build.ninja` 新而先重新生成 app 构建图；随后检查图中只剩一个 TCP 服务对象。Vitis 生成的链接后尺寸统计使用未写绝对路径的 `arm-none-eabi-size`，脚本会从该构建树记录的 ARM 编译器定位工具链，并只在 Ninja 运行期间加入进程 PATH。构建、下载 ELF 和板上验证仍由使用者执行。若 Ninja 报错，以第一条编译或链接错误为准，不再反复执行平台生成。
+预检应输出 `PS_APP_BUILD_CHECK_PASS`；实际构建应输出 `PS_APP_OPTIMIZATION_PASS`、`PS_APP_BUILD_PASS`并生成 `F:\ps\lwip_echo_server10\build\lwip_echo_server10.elf`。脚本以platform5为平台，先验证服务模块结构，再用现有Ninja构建app10；成功后核对实际compile_commands中的最后优化标志为-O2。此脚本不会重新生成平台；板卡下载和TCP验收仍需在用户指定的操作流程中进行。
 
 2026-10-08 14:07 的用户实测返回 `PS_APP_BUILD_PASS`，生成 ELF 1,145,476 字节；`arm-none-eabi-size` 给出 text 202,730、data 4,436、bss 3,233,904 字节，ELF 内含 API 17、`FFT_SNAP_WAVE_V1` 与 `SCOPE_ENV V1` 字符串。此结果证明应用构建完成；Vitis IDE 的平台任务提示仍是独立的界面状态，板端运行和 TCP 回归需在下载 ELF 后验证。
 
 ### API 17 同一快照包络复用与事件追赶
 
-后续板上截图确认原始波形、四通道完整周期包络、实时与归档 PS FFT 都有实际返回，四通道 `lock=0xf`、CRC 错误为 0；但 `PS跳过/事件缺口` 增长至 913，不能认定事件链路无损。已定位到旧版 `SCOPE ENVELOPE` 对相同 `snap_seq` 的每次 20 ms 轮询都会重新失效化并扫描 3,120,000 字节快照。现在按快照序号、地址和长度复用已完成的 16,384 字节包络及 CRC；仅在新 SNAP 到来时重新扫描，`CLEAR` 和断开会话时使缓存失效。`SCOPE_ENV V1` 的头和负载格式不变，每次应答仍有递增的 `seq`。
+后续板上截图确认过波形、包络和FFT回复，但PS跳过/事件缺口增长至913，不能认定事件链路无损。当前同一SNAP会复用已完成包络；Qt积压达到256个事件包时会持续优先排空事件批次，直到积压降到门限以下，再请求包络。此调度优先保留事件，可能推迟包络更新；必须用板测看缺口是否归零。
 
 Qt 事件优先模式在已知保留事件积压达到 256/1,024 包时，会分别在下一个包络请求前最多安排 3/6 批完整 `SCOPE PEAKS BATCH 32`，以追赶 2,048 槽事件环；原始短帧及其 PS FFT 的到期请求仍在该批量追赶前处理。正常低积压时保持原调度，20 ms 定时器与 15 秒事件展示保留规则不变。高积压时包络请求可能短暂后移，具体吞吐与丢包效果须在同一 DDS 负载下观察 60 秒的 `PS跳过/事件缺口/CRC错/SCOPE_ENV SKIP` 计数增量。此项修改未改变 PL 或 TCP 二进制协议。

@@ -2,6 +2,7 @@
 
 #include "scope_types.h"
 
+#include <QElapsedTimer>
 #include <QMainWindow>
 
 class DemoSource;
@@ -9,6 +10,7 @@ class ZynqScopeSource;
 class ChannelPanel;
 class EventTableModel;
 class SingleChannelPage;
+class SinglePhasePage;
 class QDoubleSpinBox;
 class QDockWidget;
 class QLabel;
@@ -32,6 +34,8 @@ private:
     QVector<PdPulse> detectPulses(int channel, const QVector<qint16> &samples,
                                   quint64 frameSequence, bool phaseSynchronized) const;
     bool passesHostThreshold(const PdPulse &event) const;
+    void refreshDiagnostics();
+    void collectGuiPerformanceMetrics();
 
     DemoSource *m_source = nullptr;
     ZynqScopeSource *m_zynqSource = nullptr;
@@ -44,12 +48,20 @@ private:
     QSpinBox *m_port = nullptr;
     EventTableModel *m_eventModel = nullptr;
     SingleChannelPage *m_singleChannelPage = nullptr;
+    SinglePhasePage *m_singlePhasePage = nullptr;
     QVector<QVector<PdPulse>> m_latestFramePulses;
     QThread *m_zynqThread = nullptr;
     QPushButton *m_zynqConnectButton = nullptr;
     bool m_zynqConnected = false;
     QString m_transportSummary;
     QString m_lastSourceError;
+    QString m_latestStreamDiagnostics;
+    QString m_guiPerformanceSummary;
+    QElapsedTimer m_guiPerformanceClock;
+    quint64 m_guiEventBatchCount = 0;
+    quint64 m_guiEventBatchEvents = 0;
+    qint64 m_guiEventBatchTotalNs = 0;
+    qint64 m_guiEventBatchMaxNs = 0;
     /* PL 事件全部是候选；最终显示阈值在 Qt 上位机动态执行。 */
     quint64 m_phaseEventCount = 0;
     quint64 m_phaseEventAccepted = 0;

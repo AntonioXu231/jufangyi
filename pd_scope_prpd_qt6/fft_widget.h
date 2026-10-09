@@ -20,7 +20,7 @@ protected:
 private:
     QVector<double> m_db;
     QColor m_traceColor = QColor(255, 216, 0);
-    double m_sampleRateHz = 26000000.0;
+    double m_sampleRateHz = 65000000.0;
     double m_binHz = 0.0;
     double m_peakHz = 0.0;
     double m_peakDb = -120.0;

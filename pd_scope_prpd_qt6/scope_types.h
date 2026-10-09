@@ -4,10 +4,28 @@
 #include <QMetaType>
 #include <QtGlobal>
 
+/* Temporary GUI performance counters; remove after the live-stutter diagnosis. */
+struct WidgetPaintMetrics {
+    quint64 paintCount = 0;
+    quint64 sampleVisits = 0;
+    quint64 eventVisits = 0;
+    quint64 bucketVisits = 0;
+    qint64 totalPaintNs = 0;
+    qint64 maxPaintNs = 0;
+    int maxRetainedEvents = 0;
+};
+
+constexpr quint32 kScopeSampleRateHz = 65000000U;
+constexpr quint32 kScopeMainsFrequencyHz = 50U;
+constexpr quint32 kScopeSamplesPerCycle =
+    kScopeSampleRateHz / kScopeMainsFrequencyHz;
+constexpr quint32 kScopeFftPoints = 1024U;
+constexpr quint32 kScopeMaxFftStart = kScopeSamplesPerCycle - kScopeFftPoints;
+
 /* A frame contains one simultaneous sample window for all four channels. */
 struct ScopeFrame {
     quint64 sequence = 0;
-    double sampleRateHz = 26000000.0;
+    double sampleRateHz = 65000000.0;
     bool phaseSynchronized = false;
     bool fullCycleEnvelope = false;
     quint32 phaseLockMask = 0;
@@ -46,6 +64,8 @@ struct ScopeArchiveSpectrum {
     quint32 dcCode = 0;
     QVector<qint16> samples;
     QVector<quint16> magnitudes;
+    /* Present after an explicit full-SNAP read; channel-major, all 1.3M points. */
+    QVector<QVector<qint16>> fullChannels;
 };
 
 /* Raw-window index and PL phase are independent unless the source proves a timestamp mapping. */
@@ -57,6 +77,8 @@ struct PdPulse {
     double amplitude = 0.0;
     quint64 frameSequence = 0;
     quint32 packetWordIndex = 0;
+    quint32 phaseWindow = 0;
+    bool phaseLocked = false;
     qint64 receivedAtMs = 0;
 };
 

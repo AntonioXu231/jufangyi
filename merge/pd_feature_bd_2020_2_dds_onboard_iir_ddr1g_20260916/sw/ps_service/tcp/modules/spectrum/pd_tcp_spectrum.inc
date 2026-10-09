@@ -1,3 +1,10 @@
+/* One manual transfer carries a complete selected-channel SNAP plus its PS FFT. */
+#define PD_SCOPE_FULL_SNAPSHOT_BYTES (PD_SCOPE_CYCLE_SAMPLES * PD_SCOPE_SAMPLE_BYTES)
+#define PD_SCOPE_FULL_CHANNEL_BYTES  (PD_SCOPE_CYCLE_SAMPLES * 2U)
+#define PD_SCOPE_FULL_FFT_BYTES      ((PD_FFT_POINTS / 2U + 1U) * 2U)
+static u8 s_snapshot_full_wave_buffer[PD_SCOPE_FULL_CHANNEL_BYTES +
+                                      PD_SCOPE_FULL_FFT_BYTES];
+
 static void reply_fft_result(const pd_snapshot_record_t *record, u32 index,
                              u32 start_sample, const pd_spectrum_window_t *window,
                              const pd_spectrum_result_t *result)
@@ -202,6 +209,106 @@ static void start_fft_snapshot_wave(const char *command)
     s_transfer.active = 1U;
 }
 
+/* Return every selected-channel sample, then the PS-computed 1024-point bins. */
+static void start_fft_snapshot_full(const char *command)
+{
+    unsigned long sequence_arg = 0UL, channel_arg = 0UL, start_arg = 0UL;
+    int consumed = 0;
+    const char *tail;
+    const u8 *raw;
+    u32 sample_count, i, bytes;
+    pd_snapshot_record_t record;
+    pd_spectrum_channel_t result;
+    u16 sample[PD_SNAPSHOT_CHANNELS];
+    char header[352];
+
+    if (pd_acq_state() != PD_ACQ_IDLE) {
+        (void)reply("ERR FFT FULL SNAP requires idle acquisition\r\n");
+        return;
+    }
+    if (s_transfer.active || s_scope_envelope.active || s_scope_envelope.ready) {
+        (void)reply("ERR FFT FULL SNAP transfer is busy\r\n");
+        return;
+    }
+    if (sscanf(command, "%lu CHANNEL %lu START %lu%n",
+               &sequence_arg, &channel_arg, &start_arg, &consumed) != 3 ||
+        sequence_arg > 0xFFFFFFFFUL || channel_arg >= PD_SNAPSHOT_CHANNELS ||
+        start_arg > 0xFFFFFFFFUL) {
+        (void)reply("ERR usage: FFT FULL SNAP SEQ seq CHANNEL ch START sample\r\n");
+        return;
+    }
+    tail = command + consumed;
+    while (*tail != '\0' && isspace((unsigned char)*tail)) ++tail;
+    if (*tail != '\0') {
+        (void)reply("ERR usage: FFT FULL SNAP SEQ seq CHANNEL ch START sample\r\n");
+        return;
+    }
+    if (pd_acq_get_snapshot_by_sequence((u32)sequence_arg, &record) != XST_SUCCESS ||
+        record.archive_addr == 0U) {
+        (void)reply("ERR FFT FULL SNAP sequence is outside the retained archive window\r\n");
+        return;
+    }
+    if ((record.bytes % PD_SNAPSHOT_BYTES_PER_SAMPLE) != 0U) {
+        (void)reply("ERR FFT FULL SNAP has an invalid sample stride\r\n");
+        return;
+    }
+    sample_count = record.bytes / PD_SNAPSHOT_BYTES_PER_SAMPLE;
+    if (record.bytes != PD_SCOPE_FULL_SNAPSHOT_BYTES ||
+        sample_count != PD_SCOPE_CYCLE_SAMPLES ||
+        start_arg > sample_count || PD_FFT_POINTS > sample_count - (u32)start_arg) {
+        (void)reply("ERR FFT FULL SNAP requires a complete 50 Hz snapshot and valid FFT window\r\n");
+        return;
+    }
+
+    Xil_DCacheInvalidateRange((UINTPTR)record.archive_addr, record.bytes);
+    raw = (const u8 *)(UINTPTR)record.archive_addr;
+    for (i = 0U; i < sample_count; ++i) {
+        s32 centered;
+        if (pd_snapshot_read_sample(raw, record.bytes, i, sample) != XST_SUCCESS) {
+            (void)reply("ERR FFT FULL SNAP sample decode failed\r\n");
+            return;
+        }
+        centered = (s32)sample[channel_arg] - 2048;
+        {
+            const u16 encoded = (u16)(s16)centered;
+            s_snapshot_full_wave_buffer[i * 2U] = (u8)(encoded & 0xFFU);
+            s_snapshot_full_wave_buffer[i * 2U + 1U] = (u8)(encoded >> 8);
+        }
+    }
+    if (pd_spectrum_analyze_channel(raw, record.bytes, (u32)start_arg,
+                                    s_fft_sample_rate_hz, (u32)channel_arg,
+                                    s_scope_fft_bins, &result) != XST_SUCCESS) {
+        (void)reply("ERR FFT FULL SNAP analysis failed\r\n");
+        return;
+    }
+    for (i = 0U; i <= PD_FFT_POINTS / 2U; ++i) {
+        s_snapshot_full_wave_buffer[PD_SCOPE_FULL_CHANNEL_BYTES + i * 2U] =
+            (u8)(s_scope_fft_bins[i] & 0xFFU);
+        s_snapshot_full_wave_buffer[PD_SCOPE_FULL_CHANNEL_BYTES + i * 2U + 1U] =
+            (u8)(s_scope_fft_bins[i] >> 8);
+    }
+
+    bytes = PD_SCOPE_FULL_CHANNEL_BYTES + PD_SCOPE_FULL_FFT_BYTES;
+    (void)snprintf(header, sizeof(header),
+        "FFT_SNAP_FULL_V1 seq=%lu index=%lu channel=%lu start=%lu snap_samples=%lu points=%u fs=%lu bin_hz=%lu peak_bin=%lu peak_hz=%lu amplitude=%lu dc=%lu sample_bytes=%lu bins_bytes=%lu bytes=%lu crc32=%08lx\r\n",
+        (unsigned long)record.sequence,
+        (unsigned long)(record.sequence % PD_SNAP_ARCHIVE_COUNT),
+        channel_arg, start_arg, (unsigned long)sample_count, PD_FFT_POINTS,
+        (unsigned long)s_fft_sample_rate_hz,
+        (unsigned long)(s_fft_sample_rate_hz / PD_FFT_POINTS),
+        (unsigned long)result.peak_bin, (unsigned long)result.peak_hz,
+        (unsigned long)result.amplitude_code, (unsigned long)result.dc_code,
+        (unsigned long)PD_SCOPE_FULL_CHANNEL_BYTES,
+        (unsigned long)PD_SCOPE_FULL_FFT_BYTES, (unsigned long)bytes,
+        (unsigned long)crc32(s_snapshot_full_wave_buffer, bytes));
+    if (reply(header) != 0) return;
+    s_transfer.addr = (UINTPTR)s_snapshot_full_wave_buffer;
+    s_transfer.offset = 0U;
+    s_transfer.remaining = bytes;
+    s_transfer.invalidate_cache = 0U;
+    s_transfer.active = 1U;
+}
+
 static void start_fft(char *line)
 {
     char *p = line + 4; /* "FFT " */
@@ -212,6 +319,10 @@ static void start_fft(char *line)
 
     if (strncmp(p, "WAVE SNAP SEQ ", 14U) == 0) {
         start_fft_snapshot_wave(p + 14U);
+        return;
+    }
+    if (strncmp(p, "FULL SNAP SEQ ", 14U) == 0) {
+        start_fft_snapshot_full(p + 14U);
         return;
     }
 
@@ -243,7 +354,7 @@ static void start_fft(char *line)
         p += 5;
     }
     if (strncmp(p, "SNAP ", 5) != 0) {
-        (void)reply("ERR usage: FFT BINS SNAP SEQ seq CHANNEL ch START sample | FFT [AUTO] SNAP index|SEQ sequence [start_sample]\r\n");
+        (void)reply("ERR usage: FFT FULL SNAP SEQ seq CHANNEL ch START sample | FFT WAVE SNAP SEQ seq CHANNEL ch START sample | FFT BINS SNAP SEQ seq CHANNEL ch START sample | FFT [AUTO] SNAP index|SEQ sequence [start_sample]\r\n");
         return;
     }
     p += 5;

@@ -43,12 +43,16 @@ SingleChannelPage::SingleChannelPage(QWidget *parent) : QWidget(parent)
     archiveToolbar->addWidget(latestSnapshot);
     archiveToolbar->addWidget(new QLabel(QStringLiteral("起点："), this));
     m_snapshotStart = new QSpinBox(this);
-    m_snapshotStart->setRange(0, 518976);
+    m_snapshotStart->setRange(0, static_cast<int>(kScopeMaxFftStart));
     m_snapshotStart->setSingleStep(1024);
     m_snapshotStart->setSuffix(QStringLiteral(" 点"));
     archiveToolbar->addWidget(m_snapshotStart);
     auto *archiveFft = new QPushButton(QStringLiteral("PS FFT 归档快照"), this);
     archiveToolbar->addWidget(archiveFft);
+    auto *fullSnapshot = new QPushButton(QStringLiteral("读取完整 SNAP + PS FFT"), this);
+    fullSnapshot->setToolTip(QStringLiteral(
+        "暂停采集，读取所选 SNAP 的四通道全部原始点，并由 PS 计算所选 1024 点窗 FFT。"));
+    archiveToolbar->addWidget(fullSnapshot);
     auto *liveView = new QPushButton(QStringLiteral("返回实时"), this);
     archiveToolbar->addWidget(liveView);
     archiveToolbar->addStretch(1);
@@ -60,6 +64,13 @@ SingleChannelPage::SingleChannelPage(QWidget *parent) : QWidget(parent)
                                   m_channelSelect->currentData().toInt(),
                                   static_cast<quint32>(m_snapshotStart->value()));
         m_info->setText(QStringLiteral("正在暂停采集，读取所选 SNAP 的同一 1024 点波形与 PS FFT…"));
+    });
+    connect(fullSnapshot, &QPushButton::clicked, this, [this] {
+        emit fullSnapshotRequested(static_cast<quint32>(m_snapshotSequence->value()),
+                                   m_channelSelect->currentData().toInt(),
+                                   static_cast<quint32>(m_snapshotStart->value()));
+        m_info->setText(QStringLiteral(
+            "正在暂停采集并分块读取完整 1,300,000 点快照；完成后显示全波形和所选 PS FFT…"));
     });
     connect(liveView, &QPushButton::clicked, this, &SingleChannelPage::returnToLiveView);
 
@@ -104,14 +115,23 @@ void SingleChannelPage::setSpectrum(const ScopeSpectrum &spectrum)
 void SingleChannelPage::setArchiveSpectrum(const ScopeArchiveSpectrum &spectrum)
 {
     const int channel = m_channelSelect->currentData().toInt();
-    if (spectrum.channel != channel || spectrum.samples.size() != 1024 ||
+    if (spectrum.channel < 0 || spectrum.channel > 3 || spectrum.samples.size() != 1024 ||
         spectrum.magnitudes.size() != 513) {
         m_info->setText(QStringLiteral("归档 FFT 返回数据与所选通道/点数不一致。"));
         return;
     }
     m_archiveSpectrum = spectrum;
     m_archiveView = true;
-    m_waveform->setFrame(spectrum.samples, {});
+    const bool hasCompleteSnapshot = spectrum.fullChannels.size() == 4 &&
+        spectrum.fullChannels[channel].size() == static_cast<int>(spectrum.snapshotSamples);
+    if (!hasCompleteSnapshot && spectrum.channel != channel) {
+        m_info->setText(QStringLiteral("PS FFT返回通道与当前选择不一致；请重新读取所选通道。"));
+        m_archiveView = false;
+        return;
+    }
+    m_waveform->setFrame(hasCompleteSnapshot ? spectrum.fullChannels[channel]
+                                               : spectrum.samples, {});
+    if (hasCompleteSnapshot) m_waveform->resetZoom();
     ScopeSpectrum displaySpectrum;
     displaySpectrum.sequence = spectrum.snapshotSequence;
     displaySpectrum.channel = spectrum.channel;
@@ -124,16 +144,35 @@ void SingleChannelPage::setArchiveSpectrum(const ScopeArchiveSpectrum &spectrum)
     displaySpectrum.amplitudeCode = spectrum.amplitudeCode;
     displaySpectrum.dcCode = spectrum.dcCode;
     displaySpectrum.magnitudes = spectrum.magnitudes;
-    m_fft->setSpectrum(displaySpectrum, kChannelColors[channel]);
-    m_waveTitle->setText(QStringLiteral("归档 SNAP #%1 · 通道 %2 · 起点 %3 · 同一 1024 点时域窗口")
-                             .arg(spectrum.snapshotSequence).arg(channel + 1)
-                             .arg(spectrum.startSample));
-    m_fftTitle->setText(QStringLiteral("PS 端归档 Hann 窗 FFT（同一 SNAP/通道/起点；Qt 仅绘图）"));
-    m_info->setText(QStringLiteral(
-        "SNAP #%1 · 通道 %2 · 起点 %3 / %4 · Fs %5 MSPS · Δf %6 Hz · 主峰 %7 Hz")
-        .arg(spectrum.snapshotSequence).arg(channel + 1).arg(spectrum.startSample)
-        .arg(spectrum.snapshotSamples).arg(spectrum.sampleRateHz / 1.0e6, 0, 'f', 3)
-        .arg(spectrum.binHz).arg(spectrum.peakHz));
+    if (spectrum.channel == channel)
+        m_fft->setSpectrum(displaySpectrum, kChannelColors[channel]);
+    else
+        m_fft->setWaiting(kChannelColors[channel]);
+    if (hasCompleteSnapshot) {
+        m_waveTitle->setText(QStringLiteral(
+            "完整归档 SNAP #%1 · 通道 %2 · 全部 %3 点（滚轮按像素缩放）")
+            .arg(spectrum.snapshotSequence).arg(channel + 1)
+            .arg(spectrum.snapshotSamples));
+        m_info->setText(QStringLiteral(
+            "SNAP #%1 · 通道 %2 · 已加载完整 %3 点 · FFT窗起点 %4 · FFT通道 %5 · Fs %6 MSPS · 主峰 %7 Hz")
+            .arg(spectrum.snapshotSequence).arg(channel + 1)
+            .arg(spectrum.snapshotSamples).arg(spectrum.startSample)
+            .arg(spectrum.channel + 1).arg(spectrum.sampleRateHz / 1.0e6, 0, 'f', 3)
+            .arg(spectrum.peakHz));
+    } else {
+        m_waveTitle->setText(QStringLiteral(
+            "归档 SNAP #%1 · 通道 %2 · 起点 %3 · 同一 1024 点时域窗口")
+            .arg(spectrum.snapshotSequence).arg(channel + 1).arg(spectrum.startSample));
+        m_info->setText(QStringLiteral(
+            "SNAP #%1 · 通道 %2 · 起点 %3 / %4 · Fs %5 MSPS · Δf %6 Hz · 主峰 %7 Hz")
+            .arg(spectrum.snapshotSequence).arg(channel + 1).arg(spectrum.startSample)
+            .arg(spectrum.snapshotSamples).arg(spectrum.sampleRateHz / 1.0e6, 0, 'f', 3)
+            .arg(spectrum.binHz).arg(spectrum.peakHz));
+    }
+    m_fftTitle->setText(spectrum.channel == channel
+        ? QStringLiteral("PS 端归档 Hann 窗 FFT（同一 SNAP/通道/起点；Qt 仅绘图）")
+        : QStringLiteral("FFT来自通道 %1；当前波形是通道 %2，选择通道后重新请求 PS FFT。")
+              .arg(spectrum.channel + 1).arg(channel + 1));
 }
 
 void SingleChannelPage::setSnapshotCatalog(quint64 first, quint64 next, quint32 state)
@@ -163,11 +202,34 @@ void SingleChannelPage::resetZoom()
     m_waveform->resetZoom();
 }
 
+WidgetPaintMetrics SingleChannelPage::takeWaveformPaintMetrics()
+{
+    return m_waveform->takePaintMetrics();
+}
+
 void SingleChannelPage::refreshSelectedChannel()
 {
     const int channel = m_channelSelect->currentData().toInt();
     emit channelSelected(channel);
     if (m_archiveView && channel != m_archiveSpectrum.channel) {
+        if (m_archiveSpectrum.fullChannels.size() == 4 &&
+            m_archiveSpectrum.fullChannels[channel].size() ==
+                static_cast<int>(m_archiveSpectrum.snapshotSamples)) {
+            m_waveform->setFrame(m_archiveSpectrum.fullChannels[channel], {});
+            m_waveform->resetZoom();
+            m_fft->setWaiting(kChannelColors[channel]);
+            m_waveTitle->setText(QStringLiteral(
+                "完整归档 SNAP #%1 · 通道 %2 · 全部 %3 点（滚轮按像素缩放）")
+                .arg(m_archiveSpectrum.snapshotSequence).arg(channel + 1)
+                .arg(m_archiveSpectrum.snapshotSamples));
+            m_fftTitle->setText(QStringLiteral(
+                "选择“PS FFT 归档快照”计算当前通道；FFT 由 PS 处理，Qt 仅绘图"));
+            m_info->setText(QStringLiteral(
+                "完整 SNAP #%1 · 通道 %2 · %3 点已加载；点击 PS FFT 可计算该通道所选窗口。")
+                .arg(m_archiveSpectrum.snapshotSequence).arg(channel + 1)
+                .arg(m_archiveSpectrum.snapshotSamples));
+            return;
+        }
         m_archiveView = false;
         m_waveTitle->setText(QStringLiteral("当前完整采样帧 · 时域波形"));
         m_fftTitle->setText(QStringLiteral("PS 端同帧 Hann 窗 FFT（去直流；Qt 仅绘图）"));

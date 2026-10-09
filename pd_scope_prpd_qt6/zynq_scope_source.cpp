@@ -9,6 +9,11 @@
 
 #include <cmath>
 
+namespace {
+constexpr quint32 kSnapshotRawBytes = kScopeSamplesPerCycle * 6U;
+constexpr quint32 kSnapshotReadChunkBytes = 16384U;
+}
+
 ZynqScopeSource::ZynqScopeSource(QObject *parent) : QObject(parent)
 {
     m_socket = new QTcpSocket(this);
@@ -23,6 +28,11 @@ ZynqScopeSource::ZynqScopeSource(QObject *parent) : QObject(parent)
         m_archiveFftTimer->stop();
         m_archiveFftPhase = ArchiveFftPhase::None;
         m_resumeAfterSnapshotFft = false;
+        m_snapshotFullPending = false;
+        m_downloadFullSnapshot = false;
+        m_snapshotRawBuffer.clear();
+        m_fullSnapshotChannels.clear();
+        m_fullSnapshotSequence = 0xFFFFFFFFU;
         resetFrame();
         emit disconnected();
     });
@@ -76,7 +86,6 @@ void ZynqScopeSource::connectToBoard(const QString &host, quint16 port)
     m_frameDue = false;
     m_envelopeDue = false;
     m_forcePeaksAfterEnvelope = false;
-    m_peaksSinceEnvelope = 0U;
     m_nextNormalIsFrame = true;
     m_manualPeaksPending = false;
     m_spectrumPending = false;
@@ -105,6 +114,12 @@ void ZynqScopeSource::connectToBoard(const QString &host, quint16 port)
         m_resumeAfterSnapshotFft = false;
     m_archiveFftPhase = ArchiveFftPhase::None;
     m_snapshotFftPending = false;
+    m_snapshotFullPending = false;
+    m_downloadFullSnapshot = false;
+    m_snapshotReadOffset = 0U;
+    m_snapshotRawBuffer.clear();
+    m_fullSnapshotChannels.clear();
+    m_fullSnapshotSequence = 0xFFFFFFFFU;
     m_catalogPending = false;
     m_resumeAfterSnapshotFft = false;
     resetFrame();
@@ -135,7 +150,6 @@ void ZynqScopeSource::disconnectFromBoard()
 void ZynqScopeSource::setEventPriority(bool enabled)
 {
     m_eventPriority = enabled;
-    m_peaksSinceEnvelope = 0U;
     if (m_streaming) {
         if (enabled) m_frameTimer->start();
         else {
@@ -170,6 +184,7 @@ void ZynqScopeSource::onConnected()
     emit connected();
     emit statusChanged(QStringLiteral("已连接 Zynq；正在检查实时事件协议。"));
     m_configPending = true;
+    m_requestStartedAtMs = QDateTime::currentMSecsSinceEpoch();
     sendLine(QStringLiteral("CONFIG"));
 }
 
@@ -200,21 +215,25 @@ void ZynqScopeSource::processLines()
         }
         if (m_configPending && line.startsWith(QStringLiteral("CONFIG "))) {
             m_configPending = false;
+            m_requestStartedAtMs = 0;
             static const QRegularExpression apiExpression(
                 QStringLiteral("(?:^|\\s)api=(\\d+)(?:\\s|$)"));
             const auto match = apiExpression.match(line);
             const int api = match.hasMatch() ? match.captured(1).toInt() : 0;
-            if (api < 17 || !line.contains(
-                    QStringLiteral("scope_env=cycle520000_bins1024_ch4_minmax16")) ||
+            if (api < 18 || !line.contains(
+                    QStringLiteral("scope_env=cycle1300000_bins1024_ch4_minmax16")) ||
                 !line.contains(QStringLiteral("scope_peaks_batch=32")) ||
-                !line.contains(QStringLiteral("snap_fft_wave=ps_q15_1024x1_samples_plus_bins"))) {
+                !line.contains(QStringLiteral("snap_fft_wave=ps_q15_1024x1_samples_plus_bins")) ||
+                !line.contains(QStringLiteral("snap_full=raw6b_1300000")) ||
+                !line.contains(QStringLiteral("event_meta=per_packet_v1"))) {
                 emit sourceError(QStringLiteral(
-                    "板端协议 API %1 缺少批量事件/全周期包络/归档 FFT 能力。请导入 PS API 17 源码并由你在 Vitis 中构建下载；本程序不会启动采集。")
+                    "板端协议 API %1 缺少完整快照/事件包相位元数据/批量事件/全周期包络/归档 FFT 能力。请构建并下载 PS API 18 ELF；本程序不会启动采集。")
                     .arg(api));
                 continue;
             }
             emit statusChanged(QStringLiteral("板端 API %1 已确认；启动连续采集。").arg(api));
             m_startPending = true;
+            m_requestStartedAtMs = QDateTime::currentMSecsSinceEpoch();
             sendLine(QStringLiteral("START 0"));
             continue;
         }
@@ -222,6 +241,7 @@ void ZynqScopeSource::processLines()
             m_startPending = false;
             m_ownsAcquisition = false;
             m_scopeOnPending = true;
+            m_requestStartedAtMs = QDateTime::currentMSecsSinceEpoch();
             sendLine(QStringLiteral("SCOPE ON 1024"));
             continue;
         }
@@ -235,6 +255,7 @@ void ZynqScopeSource::processLines()
             m_requestKind = RequestKind::None;
             m_startPending = false;
             m_scopeOnPending = false;
+            m_requestStartedAtMs = 0;
             m_frameTimer->stop();
             m_envelopeTimer->stop();
             emit sourceError(line);
@@ -244,15 +265,16 @@ void ZynqScopeSource::processLines()
             m_startPending = false;
             m_ownsAcquisition = true;
             m_scopeOnPending = true;
+            m_requestStartedAtMs = QDateTime::currentMSecsSinceEpoch();
             sendLine(QStringLiteral("SCOPE ON 1024"));
             continue;
         }
         if (m_scopeOnPending && line.startsWith(QStringLiteral("OK SCOPE ON"))) {
             m_scopeOnPending = false;
+            m_requestStartedAtMs = 0;
             m_scopeEnabled = true;
             m_streaming = true;
             m_nextNormalIsFrame = true;
-            m_peaksSinceEnvelope = 0U;
             m_eventBacklogPackets = 0U;
             emit statusChanged(m_eventPriority
                 ? QStringLiteral("实时事件流已启动；四通道全周期包络、PL 事件与 PS FFT 开始轮询。")
@@ -332,19 +354,40 @@ void ZynqScopeSource::processLines()
                             "所选 SNAP #%1 已被四槽环覆盖，自动改用最新可用 SNAP #%2。")
                             .arg(requestedSequence).arg(m_snapshotFftSequence));
                     }
-                    m_archiveFftPhase = ArchiveFftPhase::Transfer;
-                    m_requestKind = RequestKind::SnapshotSpectrum;
-                    m_requestStartedAtMs = QDateTime::currentMSecsSinceEpoch();
-                    sendLine(QStringLiteral("FFT WAVE SNAP SEQ %1 CHANNEL %2 START %3")
-                        .arg(m_snapshotFftSequence).arg(m_snapshotFftChannel)
-                        .arg(m_snapshotFftStart));
-                    publishStreamDiagnostics();
+                    if (m_downloadFullSnapshot) {
+                        m_archiveFftPhase = ArchiveFftPhase::SnapshotRead;
+                        requestNextSnapshotChunk();
+                    } else {
+                        requestArchiveSpectrum();
+                    }
                 } else {
                     emit snapshotCatalogReady(first, next, state);
                     finishRequest(false);
                 }
             }
             continue;
+        }
+        if (line.startsWith(QStringLiteral("DATA V2 "))) {
+            static const QRegularExpression expression(QStringLiteral(
+                "^DATA V2 kind=SNAP index=(\\d+) offset=(\\d+) bytes=(\\d+) crc32=([0-9a-fA-F]{8})$"));
+            const auto match = expression.match(line);
+            const quint32 remaining = kSnapshotRawBytes - m_snapshotReadOffset;
+            const quint32 expectedChunk = qMin(kSnapshotReadChunkBytes, remaining);
+            if (!match.hasMatch() || m_requestKind != RequestKind::SnapshotChunk ||
+                m_archiveFftPhase != ArchiveFftPhase::SnapshotRead ||
+                match.captured(1).toUInt() != m_snapshotFftSequence % 4U ||
+                match.captured(2).toUInt() != m_snapshotReadOffset ||
+                match.captured(3).toUInt() != expectedChunk || expectedChunk == 0U) {
+                emit sourceError(QStringLiteral("完整 SNAP 分块头与请求序号/偏移/长度不匹配。"));
+                finishArchiveFft(true);
+                continue;
+            }
+            m_expectedBytes = expectedChunk;
+            m_expectedCrc = match.captured(4).toUInt(nullptr, 16);
+            m_waitingBinary = true;
+            m_binaryKind = BinaryKind::SnapshotChunk;
+            processBinary();
+            return;
         }
         if (line.startsWith(QStringLiteral("FFT_SNAP_WAVE_V1 "))) {
             static const QRegularExpression expression(QStringLiteral(
@@ -377,8 +420,9 @@ void ZynqScopeSource::processLines()
                 m_archiveSpectrum.channel != static_cast<int>(m_snapshotFftChannel) ||
                 m_archiveSpectrum.snapshotSequence != m_snapshotFftSequence ||
                 m_archiveSpectrum.startSample != m_snapshotFftStart ||
-                m_archiveSpectrum.snapshotSamples != 520000U || samples != 1024U ||
-                points != 1024U || m_archiveSpectrum.sampleRateHz != 26000000U ||
+                m_archiveSpectrum.snapshotSamples != kScopeSamplesPerCycle ||
+                samples != kScopeFftPoints || points != kScopeFftPoints ||
+                m_archiveSpectrum.sampleRateHz != kScopeSampleRateHz ||
                 m_archiveSpectrum.binHz == 0U || m_archiveSpectrum.peakBin > 512U ||
                 m_expectedSnapshotSampleBytes != 2048U ||
                 m_expectedSnapshotBinsBytes != 1026U || m_expectedBytes != 3074U) {
@@ -386,6 +430,9 @@ void ZynqScopeSource::processLines()
                 finishArchiveFft(true);
                 continue;
             }
+            m_archiveSpectrum.fullChannels =
+                m_fullSnapshotSequence == m_archiveSpectrum.snapshotSequence
+                    ? m_fullSnapshotChannels : QVector<QVector<qint16>>{};
             m_waitingBinary = true;
             m_binaryKind = BinaryKind::SnapshotSpectrum;
             processBinary();
@@ -434,10 +481,11 @@ void ZynqScopeSource::processLines()
             m_expectedSampleRate = match.captured(6).toUInt();
             m_expectedEnvelopeLockMask = match.captured(7).toUInt(nullptr, 16);
             m_expectedCrc = match.captured(8).toUInt(nullptr, 16);
-            if (m_requestKind != RequestKind::Envelope || m_expectedSourceSamples != 520000U ||
+            if (m_requestKind != RequestKind::Envelope ||
+                m_expectedSourceSamples != kScopeSamplesPerCycle ||
                 m_expectedEnvelopeBins != 1024U || m_expectedBytes != 16384U ||
                 m_expectedBytes != m_expectedEnvelopeBins * 4U * 4U ||
-                m_expectedSampleRate != 26000000U) {
+                m_expectedSampleRate != 65000000U) {
                 emit sourceError(QStringLiteral("全周期包络帧参数无效。"));
                 finishRequest(true);
                 continue;
@@ -499,12 +547,12 @@ void ZynqScopeSource::processLines()
             processBinary();
             return;
         }
-        if (line.startsWith(QStringLiteral("PEAKS V3 "))) {
+        if (line.startsWith(QStringLiteral("PEAKS V4 packets="))) {
             static const QRegularExpression expression(QStringLiteral(
-                "^PEAKS V3 packets=(\\d+) peaks=(\\d+) bytes=(\\d+) crc32=([0-9a-fA-F]{8}) wins=(\\d+),(\\d+),(\\d+),(\\d+) lock=([0-9a-fA-F]+) first=(\\d+) next=(\\d+) start=(\\d+) gap=(\\d+) skipped=(\\d+)$"));
+                "^PEAKS V4 packets=(\\d+) peaks=(\\d+) bytes=(\\d+) crc32=([0-9a-fA-F]{8}) wins=(\\d+),(\\d+),(\\d+),(\\d+) lock=([0-9a-fA-F]+) first=(\\d+) next=(\\d+) start=(\\d+) gap=(\\d+) skipped=(\\d+)$"));
             const auto match = expression.match(line);
             if (!match.hasMatch() || m_requestKind != RequestKind::Peaks) {
-                emit sourceError(QStringLiteral("PL 批量事件帧头格式错误：%1").arg(line));
+                emit sourceError(QStringLiteral("PL 批量事件V4帧头格式错误：%1").arg(line));
                 m_streaming = false;
                 continue;
             }
@@ -538,9 +586,10 @@ void ZynqScopeSource::processLines()
             processBinary();
             return;
         }
-        if (line.startsWith(QStringLiteral("PEAKS V2 "))) {
+        if (line.startsWith(QStringLiteral("PEAKS V2 ")) ||
+            line.startsWith(QStringLiteral("PEAKS V4 "))) {
             static const QRegularExpression expression(QStringLiteral(
-                "^PEAKS V2 seq=(\\d+) total=(\\d+) words=(\\d+) bytes=(\\d+) crc32=([0-9a-fA-F]{8}) wins=(\\d+),(\\d+),(\\d+),(\\d+) lock=([0-9a-fA-F]+) first=(\\d+) next=(\\d+) gap=(\\d+) skipped=(\\d+)$"));
+                "^PEAKS (?:V2|V4) seq=(\\d+) total=(\\d+) words=(\\d+) bytes=(\\d+) crc32=([0-9a-fA-F]{8}) wins=(\\d+),(\\d+),(\\d+),(\\d+) lock=([0-9a-fA-F]+) first=(\\d+) next=(\\d+) gap=(\\d+) skipped=(\\d+)$"));
             const auto match = expression.match(line);
             if (!match.hasMatch()) {
                 emit sourceError(QStringLiteral("PL 完整事件帧头格式错误：%1").arg(line));
@@ -611,7 +660,7 @@ void ZynqScopeSource::processLines()
         }
         if (line.startsWith(QStringLiteral("PEAKS V1 "))) {
             m_streaming = false;
-            emit sourceError(QStringLiteral("板端仍在发送 PEAKS V1 抽取数据；需要下载 API 17 ELF。"));
+            emit sourceError(QStringLiteral("板端仍在发送 PEAKS V1 抽取数据；需要下载 API 18 ELF。"));
             continue;
         }
         emit statusChanged(line);
@@ -633,7 +682,7 @@ void ZynqScopeSource::processBinary()
         emit eventTransportStatus(m_archiveFirst, m_archiveNext, m_psSkipped,
                                  m_sequenceGaps, m_crcErrors);
         resetFrame();
-        if (completedKind == BinaryKind::SnapshotSpectrum)
+        if (m_archiveFftPhase != ArchiveFftPhase::None)
             finishArchiveFft(true);
         else
             finishRequest(true);
@@ -690,6 +739,58 @@ void ZynqScopeSource::processBinary()
         return;
     }
 
+    if (completedKind == BinaryKind::SnapshotChunk) {
+        const quint32 expectedChunk = qMin(kSnapshotReadChunkBytes,
+                                           kSnapshotRawBytes - m_snapshotReadOffset);
+        if (m_archiveFftPhase != ArchiveFftPhase::SnapshotRead ||
+            m_frame.size() != static_cast<int>(expectedChunk)) {
+            emit sourceError(QStringLiteral("完整 SNAP 分块长度与当前读取位置不匹配。"));
+            resetFrame();
+            finishArchiveFft(true);
+            return;
+        }
+        m_snapshotRawBuffer += m_frame;
+        m_snapshotReadOffset += static_cast<quint32>(m_frame.size());
+        resetFrame();
+        m_requestKind = RequestKind::None;
+        m_requestStartedAtMs = 0;
+        if (m_disconnectRequested) {
+            finishArchiveFft(false);
+            return;
+        }
+        if (m_snapshotReadOffset < kSnapshotRawBytes) {
+            requestNextSnapshotChunk();
+            publishStreamDiagnostics();
+            return;
+        }
+        if (m_snapshotRawBuffer.size() != static_cast<int>(kSnapshotRawBytes)) {
+            emit sourceError(QStringLiteral("完整 SNAP 分块总长度与 1,300,000 点快照不符。"));
+            finishArchiveFft(true);
+            return;
+        }
+        m_fullSnapshotChannels.resize(4);
+        for (auto &channel : m_fullSnapshotChannels)
+            channel.resize(static_cast<int>(kScopeSamplesPerCycle));
+        const auto *raw = reinterpret_cast<const uchar *>(m_snapshotRawBuffer.constData());
+        for (quint32 sampleIndex = 0; sampleIndex < kScopeSamplesPerCycle; ++sampleIndex) {
+            const uchar *p = raw + sampleIndex * 6U;
+            const quint16 code[4] = {
+                static_cast<quint16>(p[0] | ((p[1] & 0x0FU) << 8)),
+                static_cast<quint16>((p[1] >> 4) | (p[2] << 4)),
+                static_cast<quint16>(p[3] | ((p[4] & 0x0FU) << 8)),
+                static_cast<quint16>((p[4] >> 4) | (p[5] << 4))
+            };
+            for (int channel = 0; channel < 4; ++channel)
+                m_fullSnapshotChannels[channel][static_cast<int>(sampleIndex)] =
+                    static_cast<qint16>(code[channel]) - 2048;
+        }
+        m_fullSnapshotSequence = m_snapshotFftSequence;
+        m_snapshotRawBuffer.clear();
+        m_snapshotRawBuffer.squeeze();
+        requestArchiveSpectrum();
+        return;
+    }
+
     if (completedKind == BinaryKind::SnapshotSpectrum) {
         m_archiveSpectrum.samples.resize(static_cast<int>(m_expectedSnapshotSamples));
         m_archiveSpectrum.magnitudes.resize(static_cast<int>(m_expectedSnapshotBinsBytes / 2U));
@@ -719,14 +820,19 @@ void ZynqScopeSource::processBinary()
         events.reserve(static_cast<int>(m_expectedPeakCount));
 
         while (records < m_expectedPeakPackets) {
-            if (m_expectedBytes - offset < 8U) {
+            if (m_expectedBytes - offset < 28U) {
                 emit sourceError(QStringLiteral("PL 批量事件记录头被截断。"));
                 batchMalformed = true;
                 break;
             }
             const quint32 sequence = qFromLittleEndian<quint32>(payload + offset);
             const quint32 recordBytes = qFromLittleEndian<quint32>(payload + offset + 4U);
-            offset += 8U;
+            const quint32 recordLockMask = qFromLittleEndian<quint32>(payload + offset + 8U);
+            quint32 recordPhaseWindows[4];
+            for (quint32 channel = 0U; channel < 4U; ++channel)
+                recordPhaseWindows[channel] =
+                    qFromLittleEndian<quint32>(payload + offset + 12U + channel * 4U);
+            offset += 28U;
             if (recordBytes == 0U || (recordBytes & 7U) != 0U ||
                 recordBytes > 65536U || recordBytes > m_expectedBytes - offset) {
                 emit sourceError(QStringLiteral("PL 批量事件记录长度无效。"));
@@ -755,10 +861,11 @@ void ZynqScopeSource::processBinary()
                 pulse.channel = static_cast<int>((word >> 25) & 0x3U);
                 pulse.sampleIndex = -1;
                 const quint32 phaseIndex = static_cast<quint32>((word >> 28) & 0xFFFU);
-                const quint32 phaseWindow = m_phaseWindows[pulse.channel];
+                const quint32 phaseWindow = recordPhaseWindows[pulse.channel];
+                pulse.phaseWindow = phaseWindow;
+                pulse.phaseLocked = (recordLockMask & (1U << pulse.channel)) != 0U;
                 pulse.phaseValid = phaseWindow != 0U && phaseWindow <= 2048U &&
-                    phaseIndex < phaseWindow &&
-                    ((m_phaseLockMask & (1U << pulse.channel)) != 0U);
+                    phaseIndex < phaseWindow && pulse.phaseLocked;
                 if (phaseWindow != 0U && phaseIndex < phaseWindow)
                     pulse.phaseDeg = static_cast<double>(phaseIndex) * 360.0 / phaseWindow;
                 pulse.amplitude = static_cast<qint16>((word >> 40) & 0xFFFFU);
@@ -822,9 +929,11 @@ void ZynqScopeSource::processBinary()
             pulse.sampleIndex = -1; // PL pulse timing is phase-indexed, not raw-window-indexed.
             const quint32 phaseIndex = static_cast<quint32>((word >> 28) & 0xFFFU);
             const quint32 phaseWindow = m_phaseWindows[pulse.channel];
+            pulse.phaseWindow = phaseWindow;
+            pulse.phaseLocked = (m_phaseLockMask & (1U << pulse.channel)) != 0U;
             pulse.phaseValid = phaseWindow != 0U && phaseWindow <= 2048U &&
                                phaseIndex < phaseWindow &&
-                               ((m_phaseLockMask & (1U << pulse.channel)) != 0U);
+                               pulse.phaseLocked;
             if (phaseWindow != 0U && phaseIndex < phaseWindow)
                 pulse.phaseDeg = static_cast<double>(phaseIndex) * 360.0 / phaseWindow;
             pulse.amplitude = static_cast<qint16>((word >> 40) & 0xFFFFU);
@@ -892,7 +1001,6 @@ void ZynqScopeSource::requestNextEnvelope()
         m_requestKind != RequestKind::None) return;
     m_envelopeDue = false;
     m_forcePeaksAfterEnvelope = true;
-    m_peaksSinceEnvelope = 0U;
     m_requestKind = RequestKind::Envelope;
     m_requestStartedAtMs = QDateTime::currentMSecsSinceEpoch();
     sendLine(QStringLiteral("SCOPE ENVELOPE"));
@@ -904,7 +1012,6 @@ void ZynqScopeSource::requestNextPeaks()
     if (!m_streaming || m_socket->state() != QAbstractSocket::ConnectedState ||
         m_requestKind != RequestKind::None) return;
     m_requestKind = RequestKind::Peaks;
-    if (!m_currentRequestWasManual) ++m_peaksSinceEnvelope;
     m_requestStartedAtMs = QDateTime::currentMSecsSinceEpoch();
     sendLine(QStringLiteral("SCOPE PEAKS BATCH 32"));
     publishStreamDiagnostics();
@@ -947,8 +1054,9 @@ void ZynqScopeSource::requestSnapshotFft(quint32 sequence, int channel, quint32 
         emit sourceError(QStringLiteral("归档 FFT 需要先连接 Zynq。"));
         return;
     }
-    if (channel < 0 || channel > 3 || startSample > 518976U) {
-        emit sourceError(QStringLiteral("归档 FFT 参数越界；通道为 0..3，起点为 0..518976。"));
+    if (channel < 0 || channel > 3 || startSample > kScopeMaxFftStart) {
+        emit sourceError(QStringLiteral("归档 FFT 参数越界；通道为 0..3，起点为 0..%1。")
+                             .arg(kScopeMaxFftStart));
         return;
     }
     if (m_archiveFftPhase != ArchiveFftPhase::None || m_snapshotFftPending) {
@@ -960,6 +1068,59 @@ void ZynqScopeSource::requestSnapshotFft(quint32 sequence, int channel, quint32 
     m_snapshotFftStart = startSample;
     m_snapshotFftPending = true;
     schedulePump();
+}
+
+void ZynqScopeSource::requestFullSnapshotFft(quint32 sequence, int channel,
+                                            quint32 startSample)
+{
+    if (m_socket->state() != QAbstractSocket::ConnectedState) {
+        emit sourceError(QStringLiteral("读取完整 SNAP 需要先连接 Zynq。"));
+        return;
+    }
+    if (channel < 0 || channel > 3 || startSample > kScopeMaxFftStart) {
+        emit sourceError(QStringLiteral("完整 SNAP/FFT 参数越界；通道为 0..3，起点为 0..%1。")
+                             .arg(kScopeMaxFftStart));
+        return;
+    }
+    if (m_archiveFftPhase != ArchiveFftPhase::None || m_snapshotFftPending) {
+        emit sourceError(QStringLiteral("已有归档读取正在进行。"));
+        return;
+    }
+    m_snapshotFftSequence = sequence;
+    m_snapshotFftChannel = static_cast<quint32>(channel);
+    m_snapshotFftStart = startSample;
+    m_snapshotFullPending = true;
+    m_snapshotFftPending = true;
+    schedulePump();
+}
+
+void ZynqScopeSource::requestNextSnapshotChunk()
+{
+    if (m_archiveFftPhase != ArchiveFftPhase::SnapshotRead ||
+        m_socket->state() != QAbstractSocket::ConnectedState ||
+        m_snapshotReadOffset >= kSnapshotRawBytes) return;
+    const quint32 bytes = qMin(kSnapshotReadChunkBytes,
+                               kSnapshotRawBytes - m_snapshotReadOffset);
+    m_requestKind = RequestKind::SnapshotChunk;
+    m_requestStartedAtMs = QDateTime::currentMSecsSinceEpoch();
+    sendLine(QStringLiteral("GET SNAP SEQ %1 %2 %3")
+        .arg(m_snapshotFftSequence).arg(m_snapshotReadOffset).arg(bytes));
+    publishStreamDiagnostics();
+}
+
+void ZynqScopeSource::requestArchiveSpectrum()
+{
+    if (m_socket->state() != QAbstractSocket::ConnectedState) {
+        finishArchiveFft(false);
+        return;
+    }
+    m_archiveFftPhase = ArchiveFftPhase::Transfer;
+    m_requestKind = RequestKind::SnapshotSpectrum;
+    m_requestStartedAtMs = QDateTime::currentMSecsSinceEpoch();
+    sendLine(QStringLiteral("FFT WAVE SNAP SEQ %1 CHANNEL %2 START %3")
+        .arg(m_snapshotFftSequence).arg(m_snapshotFftChannel)
+        .arg(m_snapshotFftStart));
+    publishStreamDiagnostics();
 }
 
 void ZynqScopeSource::finishRequest(bool emptyPeaks)
@@ -1001,12 +1162,21 @@ void ZynqScopeSource::pumpRequests()
     }
     if (m_snapshotFftPending) {
         m_snapshotFftPending = false;
+        m_downloadFullSnapshot = m_snapshotFullPending;
+        m_snapshotFullPending = false;
         m_resumeAfterSnapshotFft = true;
         m_streaming = false;
         m_frameTimer->stop();
         m_envelopeTimer->stop();
         m_pumpTimer->stop();
         m_archiveFftPollCount = 0U;
+        m_snapshotReadOffset = 0U;
+        if (m_downloadFullSnapshot) {
+            m_snapshotRawBuffer.clear();
+            m_snapshotRawBuffer.reserve(static_cast<int>(kSnapshotRawBytes));
+            m_fullSnapshotChannels.clear();
+            m_fullSnapshotSequence = 0xFFFFFFFFU;
+        }
         m_archiveFftPhase = ArchiveFftPhase::DisableScope;
         m_requestStartedAtMs = QDateTime::currentMSecsSinceEpoch();
         sendLine(QStringLiteral("SCOPE OFF"));
@@ -1038,16 +1208,13 @@ void ZynqScopeSource::pumpRequests()
         requestNextPeaks();
         return;
     }
-    /* A 2048-slot archive can be overwritten while a full-cycle envelope
-     * is processed. Drain several complete event batches first only when the
-     * retained backlog grows; waveform and FFT deadlines above still run. */
-    if (m_eventPriority && m_envelopeDue) {
-        const quint32 burstLimit = m_eventBacklogPackets >= 1024U ? 6U :
-                                   m_eventBacklogPackets >= 256U ? 3U : 0U;
-        if (m_peaksSinceEnvelope < burstLimit) {
-            requestNextPeaks();
-            return;
-        }
+    /* Keep draining PL event packets while the backlog is material. Starting
+     * a multi-pass 1.3M-point envelope scan in that state can age snapshots
+     * out of the four-slot ring and increase event loss. The envelope timer
+     * remains due and is serviced as soon as the backlog falls below 256. */
+    if (m_eventPriority && m_eventBacklogPackets >= 256U) {
+        requestNextPeaks();
+        return;
     }
     if (m_envelopeDue) {
         requestNextEnvelope();
@@ -1150,6 +1317,10 @@ void ZynqScopeSource::finishArchiveFft(bool resumeAcquisition)
     m_waitingBinary = false;
     m_binaryKind = BinaryKind::None;
     m_archiveFftPollCount = 0U;
+    m_downloadFullSnapshot = false;
+    m_snapshotReadOffset = 0U;
+    m_snapshotRawBuffer.clear();
+    m_snapshotRawBuffer.squeeze();
     const bool disconnectAfter = m_disconnectRequested;
     const bool shouldResume = !disconnectAfter && resumeAcquisition && m_resumeAfterSnapshotFft &&
         m_socket->state() == QAbstractSocket::ConnectedState;
@@ -1162,6 +1333,7 @@ void ZynqScopeSource::finishArchiveFft(bool resumeAcquisition)
     if (shouldResume) {
         emit statusChanged(QStringLiteral("归档 FFT 完成；恢复连续采集和实时图谱。"));
         m_startPending = true;
+        m_requestStartedAtMs = QDateTime::currentMSecsSinceEpoch();
         sendLine(QStringLiteral("START 0"));
     } else {
         m_streaming = false;
@@ -1178,6 +1350,7 @@ void ZynqScopeSource::publishStreamDiagnostics()
     case RequestKind::Spectrum: pending = QStringLiteral("SCOPE FFT"); break;
     case RequestKind::Catalog: pending = QStringLiteral("CATALOG"); break;
     case RequestKind::SnapshotSpectrum: pending = QStringLiteral("FFT SNAP WAVE"); break;
+    case RequestKind::SnapshotChunk: pending = QStringLiteral("完整 SNAP 分块"); break;
     case RequestKind::None: break;
     }
     if (m_requestKind == RequestKind::None) {
@@ -1187,19 +1360,61 @@ void ZynqScopeSource::publishStreamDiagnostics()
         case ArchiveFftPhase::WaitIdle: pending = QStringLiteral("等待 IDLE"); break;
         case ArchiveFftPhase::Status: pending = QStringLiteral("STATUS"); break;
         case ArchiveFftPhase::Catalog: pending = QStringLiteral("确认 SNAP 目录"); break;
+        case ArchiveFftPhase::SnapshotRead: pending = QStringLiteral("读取完整 SNAP"); break;
         case ArchiveFftPhase::Transfer: pending = QStringLiteral("归档 FFT 传输"); break;
         case ArchiveFftPhase::None: break;
+        }
+        if (m_archiveFftPhase == ArchiveFftPhase::None) {
+            if (m_configPending) pending = QStringLiteral("CONFIG");
+            else if (m_startPending) pending = QStringLiteral("START 0");
+            else if (m_scopeOnPending) pending = QStringLiteral("SCOPE ON 1024");
         }
     }
     const qint64 elapsedMs = m_requestStartedAtMs == 0
         ? 0 : qMax<qint64>(0, QDateTime::currentMSecsSinceEpoch() - m_requestStartedAtMs);
+    const bool waitingForArchiveReply = m_requestKind == RequestKind::None &&
+        m_archiveFftPhase != ArchiveFftPhase::None &&
+        m_archiveFftPhase != ArchiveFftPhase::WaitIdle;
+    const bool waitingForStartupReply = m_requestKind == RequestKind::None &&
+        m_archiveFftPhase == ArchiveFftPhase::None &&
+        (m_configPending || m_startPending || m_scopeOnPending);
+    if ((m_requestKind != RequestKind::None || waitingForArchiveReply ||
+         waitingForStartupReply) && elapsedMs > 10000 &&
+        m_socket->state() == QAbstractSocket::ConnectedState) {
+        m_lastStreamError = QStringLiteral("请求超时（%1），已重置 TCP 会话；请重新连接。")
+                                .arg(pending);
+        emit sourceError(m_lastStreamError);
+        m_streaming = false;
+        m_requestKind = RequestKind::None;
+        m_requestStartedAtMs = 0;
+        m_archiveFftPhase = ArchiveFftPhase::None;
+        m_resumeAfterSnapshotFft = false;
+        m_snapshotFullPending = false;
+        m_downloadFullSnapshot = false;
+        m_configPending = false;
+        m_startPending = false;
+        m_scopeOnPending = false;
+        m_archiveFftTimer->stop();
+        m_frameTimer->stop();
+        m_envelopeTimer->stop();
+        m_pumpTimer->stop();
+        m_snapshotRawBuffer.clear();
+        m_snapshotRawBuffer.squeeze();
+        resetFrame();
+        m_rx.clear();
+        m_socket->abort();
+        return;
+    }
     QString message = QStringLiteral(
-        "Qt API17：帧%1；包络%2 SNAP#%3 lock=0x%4 NONE=%5 SKIP=%6；FFT%7/%8；事件缺口%9 跳过%10 待取%11；CRC%12 协议%13；待完成=%14 %15ms")
+        "Qt API18：帧%1；包络%2 SNAP#%3 lock=0x%4 NONE=%5 SKIP=%6；FFT%7/%8；事件缺口%9 跳过%10 待取%11；CRC%12 协议%13；待完成=%14 %15ms")
         .arg(m_scopeFrameCount).arg(m_envelopeFrameCount).arg(m_lastEnvelopeSequence)
         .arg(m_lastEnvelopeLockMask, 0, 16).arg(m_envelopeNoneCount).arg(m_envelopeSkipCount)
         .arg(m_liveSpectrumCount).arg(m_archiveSpectrumCount).arg(m_sequenceGaps)
         .arg(m_psSkipped).arg(m_eventBacklogPackets).arg(m_crcErrors).arg(m_protocolErrors)
         .arg(pending).arg(elapsedMs);
+    if (m_downloadFullSnapshot && m_archiveFftPhase == ArchiveFftPhase::SnapshotRead)
+        message += QStringLiteral("；完整SNAP %1/%2 bytes")
+            .arg(m_snapshotReadOffset).arg(kSnapshotRawBytes);
     if (!m_lastStreamError.isEmpty())
         message += QStringLiteral("；最近错误：%1").arg(m_lastStreamError);
     emit streamDiagnosticsChanged(message);

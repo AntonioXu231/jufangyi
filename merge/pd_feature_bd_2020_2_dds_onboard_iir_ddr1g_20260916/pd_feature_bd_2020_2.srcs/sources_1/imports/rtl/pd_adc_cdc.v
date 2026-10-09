@@ -26,7 +26,7 @@ module pd_adc_cdc #(
     parameter integer ADC_W     = 12,
     parameter integer DEPTH     = 64,           // 必须是 2 的幂 (格雷码指针)
     parameter integer CLK_HZ    = 130000000,    // 系统时钟 (Hz), PL 主时钟
-    parameter integer SAMPLE_HZ = 26000000      // ADC 采样率 (Hz), 必须整除 CLK_HZ
+    parameter integer SAMPLE_HZ = 65000000      // ADC 采样率 (Hz), 必须整除 CLK_HZ
 )(
     input  wire              adc_clk,     // ADC 位时钟 (20MHz)
     input  wire              adc_rst_n,   // 异步复位 (低有效), 两域共用

@@ -26,7 +26,12 @@ public:
     void clearPhaseEvents();
     /* 上位机动态筛选阈值；不写入 PL。历史事件保留到 15 s，到期后删除。 */
     void setEventThreshold(double rawQ88);
+    void setWaveformGain(double gain);
     void resetZoom();
+    void setZoomFactor(double factor);
+    void zoomIn();
+    void zoomOut();
+    WidgetPaintMetrics takePaintMetrics();
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -59,6 +64,8 @@ private:
     bool m_phaseSynchronized = false;
     bool m_fullCycleEnvelope = false;
     double m_zoom = 1.0;
+    double m_waveformGain = 1.0;
+    WidgetPaintMetrics m_paintMetrics;
     /* 0 保持原有行为：所有已同步的 PL 事件都显示。 */
     double m_eventThreshold = 0.0;
 };

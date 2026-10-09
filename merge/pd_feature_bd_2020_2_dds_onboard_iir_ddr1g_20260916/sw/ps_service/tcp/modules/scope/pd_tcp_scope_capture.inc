@@ -40,9 +40,10 @@ static void start_scope_frame(void)
     sum = crc32(s_scope_buffer, bytes);
     sequence = s_scope.sequence++;
     (void)snprintf(out, sizeof(out),
-        "SCOPE V1 seq=%lu samples=%lu bytes=%lu fs=26000000 crc32=%08lx\r\n",
+        "SCOPE V1 seq=%lu samples=%lu bytes=%lu fs=%lu crc32=%08lx\r\n",
         (unsigned long)sequence, (unsigned long)s_scope.samples,
-        (unsigned long)bytes, (unsigned long)sum);
+        (unsigned long)bytes, (unsigned long)PD_SPECTRUM_DEFAULT_FS_HZ,
+        (unsigned long)sum);
     if (reply(out) != 0) return;
     s_scope.last_frame_sequence = sequence;
     s_scope.last_frame_valid = 1U;
@@ -226,9 +227,10 @@ static void start_scope_event(u32 event_sequence, u32 samples,
     s_scope.last_frame_valid = 1U;
     latest_snapshot = snapshot_record.sequence;
     (void)snprintf(out, sizeof(out),
-        "SCOPE V2 seq=%lu samples=%lu bytes=%lu fs=26000000 crc32=%08lx source=SNAP snap_seq=%lu event_seq=%lu event_channel=%lu event_word_seq=%lu start=%lu center=%lu phase=%lu\r\n",
+        "SCOPE V2 seq=%lu samples=%lu bytes=%lu fs=%lu crc32=%08lx source=SNAP snap_seq=%lu event_seq=%lu event_channel=%lu event_word_seq=%lu start=%lu center=%lu phase=%lu\r\n",
         (unsigned long)scope_sequence, (unsigned long)samples,
-        (unsigned long)bytes, (unsigned long)sum,
+        (unsigned long)bytes, (unsigned long)PD_SPECTRUM_DEFAULT_FS_HZ,
+        (unsigned long)sum,
         (unsigned long)latest_snapshot, (unsigned long)event_sequence,
         (unsigned long)channel, (unsigned long)event_word_sequence,
         (unsigned long)start, (unsigned long)center, (unsigned long)phase);
@@ -243,4 +245,4 @@ static void start_scope_event(u32 event_sequence, u32 samples,
 /* Copy one retained PL event packet into a PS-owned transfer buffer.  The
  * peak phase is measured against sync_in by pd_feature_core, not inferred
  * from the unrelated raw DDR oscilloscope window.  This legacy single-record
- * response is retained for diagnostic clients; API 17 Qt uses the batch form. */
+ * response is retained for diagnostic clients; API 18 Qt uses the batch form. */

@@ -2,10 +2,12 @@
 # Enable synthesizable on-board DDS test mode for pd_feature_bd_2020_2.
 #
 # Run in the already-open Vivado project:
-#   source {F:/xinya/v5/merge/pd_feature_bd_2020_2/scripts/06_enable_onboard_dds_test_mode.tcl}
+#   source {F:/xinya/v5/merge/pd_feature_bd_2020_2_dds_onboard_iir_ddr1g_20260916/scripts/06_enable_onboard_dds_test_mode.tcl}
+# First run sim/generate_pd_adc_waveform_physical_model.m in MATLAB so the
+# COE ROM images and generated pd_pd_event_schedule.v match the model.
 #
 # Board-test topology:
-#   clk_wiz_0/clk_out2 (26 MHz) -> pd_dds_0 -> pd_ddr_0
+#   clk_wiz_0/clk_out2 (65 MHz) -> pd_dds_0 -> pd_ddr_0
 #   pd_ddr_0 (CDC to clk_out1 = 130 MHz) -> pd_feature_0 -> AXI event output
 #
 # External ADC ports and their external-clock XDC are disabled in this test
@@ -20,12 +22,19 @@ if {[get_property NAME [current_project]] ne $expected_project} {
 
 set project_dir [get_property DIRECTORY [current_project]]
 set dds_src [file normalize [file join $project_dir pd_feature_bd_2020_2.srcs sources_1 imports rtl pd_dds_adc_source.v]]
+set schedule_src [file normalize [file join $project_dir pd_feature_bd_2020_2.srcs sources_1 imports rtl pd_pd_event_schedule.v]]
 if {![file exists $dds_src]} {
     error "DDS RTL not found: $dds_src"
+}
+if {![file exists $schedule_src]} {
+    error "MATLAB-generated event schedule is missing: $schedule_src. Run the MATLAB generator first."
 }
 
 if {[llength [get_files -quiet $dds_src]] == 0} {
     add_files -fileset sources_1 -norecurse $dds_src
+}
+if {[llength [get_files -quiet $schedule_src]] == 0} {
+    add_files -fileset sources_1 -norecurse $schedule_src
 }
 update_compile_order -fileset sources_1
 
@@ -72,7 +81,7 @@ foreach port_name {adc_clk_0 adc_data_0 adc_dv_0 sync_in_0} {
 
 # Connect through source pins, not a named BD net.  This avoids Vivado 2020.2
 # collection issues and makes the script repeatable after a partially applied
-# GUI edit. clk_out2 must already be enabled at 26 MHz in the Clock Wizard;
+# GUI edit. clk_out2 must already be enabled at 65 MHz in the Clock Wizard;
 # it clocks the DDS and ADC-side capture logic. clk_out1 remains the 130 MHz
 # system clock.
 connect_bd_net [get_bd_pins clk_wiz_0/clk_out2] [get_bd_pins pd_dds_0/clk]
@@ -85,7 +94,7 @@ connect_bd_net [get_bd_pins pd_dds_0/sync_in] \
                [get_bd_pins pd_feature_0/sync_in] \
                [get_bd_pins sync_pulse_0/sync_in]
 
-# The original XDC describes an external 26 MHz port that no longer exists in
+# The original XDC described an external 26 MHz port that no longer exists in
 # this build. Disable it rather than weakening or waiving any DRC.
 set external_adc_xdc [get_files -quiet */pd_feature_bd_timing.xdc]
 if {[llength $external_adc_xdc] != 1} {
@@ -99,12 +108,18 @@ generate_target all $bd_file
 export_ip_user_files -of_objects $bd_file -no_script -sync -force -quiet
 update_compile_order -fileset sources_1
 
+set coe_setup_script [file normalize [file join $project_dir scripts 13_configure_matlab_coe_roms.tcl]]
+if {![file exists $coe_setup_script]} {
+    error "COE ROM setup script missing: $coe_setup_script"
+}
+source $coe_setup_script
+
 reset_run synth_1
 reset_run impl_1
 
 puts ""
 puts "ONBOARD_DDS_TEST_MODE_PASS"
 puts "  External ADC ports removed from this test build."
-puts "  pd_dds_0 supplies four channels at effective 26 MSPS and 50 Hz sync."
+puts "  pd_dds_0 supplies four channels at effective 65 MSPS and 50 Hz sync."
 puts "  External ADC XDC disabled: $external_adc_xdc"
 puts "  synth_1 and impl_1 reset; rebuild before adding ILA."

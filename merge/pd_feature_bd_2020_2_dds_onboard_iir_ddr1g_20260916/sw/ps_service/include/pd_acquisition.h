@@ -9,6 +9,7 @@
  * 32 seconds, leaving headroom beyond the host's 15-second display window. */
 #define PD_EVENT_ARCHIVE_COUNT 2048U
 #define PD_SNAP_ARCHIVE_COUNT  4U
+#define PD_ACQ_SHARED_VERSION  4U
 
 typedef struct {
     u32 sequence;
@@ -16,6 +17,8 @@ typedef struct {
     u32 bytes;
     u32 peak_words;
     u32 cycle_words;
+    u32 phase_lock_mask;
+    u32 phase_window[4];
 } pd_event_record_t;
 
 typedef struct {
@@ -35,6 +38,7 @@ typedef struct {
     u32 snapshot_sequence;
     u32 event_overwrites;
     u32 snapshot_overwrites;
+    u32 snapshot_pin_drops;
     u32 dma_errors;
     u32 slot_errors;
     u32 recovery_count;
@@ -72,6 +76,9 @@ int pd_acq_recover(u32 *discarded_slots);
 /* Sequence lookup rejects records overwritten by the PS DDR archive ring. */
 int pd_acq_get_event_by_sequence(u32 sequence, pd_event_record_t *record);
 int pd_acq_get_snapshot_by_sequence(u32 sequence, pd_snapshot_record_t *record);
+/* Pin one retained PS snapshot while a bounded analysis job reads it. */
+int pd_acq_pin_snapshot(u32 sequence);
+int pd_acq_unpin_snapshot(u32 sequence);
 const char *pd_acq_last_error(void);
 void pd_acq_set_poll_hook(pd_acq_poll_hook_t hook);
 void pd_acq_clear_metadata(void);

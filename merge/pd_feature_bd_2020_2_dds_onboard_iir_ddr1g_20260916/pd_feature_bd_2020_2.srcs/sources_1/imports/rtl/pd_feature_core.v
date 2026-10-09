@@ -28,7 +28,7 @@ module pd_feature_core #(
     parameter integer PH_W       = `PD_PH_W,
     parameter integer TS_W       = `PD_TS_W,
     parameter integer EV_W       = `PD_EV_W,
-    parameter integer SAMPLE_HZ  = 26000000
+    parameter integer SAMPLE_HZ  = 65000000
 )(
     input  wire                 clk,
     input  wire                 rst_n,

@@ -17,9 +17,9 @@
 // 本文件只做"RTL 侧"整合，AXI 主口以扁平端口引出，在 BD 里接到
 // SmartConnect，再经 PS7 的 S_AXI_HP0/HP1 落到 DDR3。
 //
-// 数据率核对（26MSPS 当前验证档）：
-//   4ch x 12bit x 26MSPS = 156 MB/s；130MHz x 8B = 1040 MB/s，占用 15%。
-//   一个 50Hz 周期快照为 3.12MB，和环写叠加后仍有充分的 HP 带宽余量。
+// 数据率核对（65MSPS 最终档）：
+//   4ch x 12bit x 65MSPS = 390 MB/s；130MHz x 8B = 1040 MB/s，占用约 37.5%。
+//   一个 50Hz 周期快照为 7.8MB，槽位为 12MiB；需在板上验证环写与快照拷贝并发带宽。
 // =============================================================================
 `include "pd_ddr_defines.vh"
 
@@ -33,7 +33,7 @@ module pd_ddr_wr_top #(
     // ================= 时钟 / 复位 =================
     input  wire                      clk,          // 130MHz PL 主时钟（PS FCLK0）
     input  wire                      rst_n,        // 系统域低有效
-    input  wire                      adc_clk,      // ADC 位时钟（当前 26M）
+    input  wire                      adc_clk,      // 65MHz ADC 位时钟
 
     // ================= ADC 输入（adc_clk 域）=================
     input  wire [CH_NUM*ADC_W-1:0]   adc_data,     // {ch3,ch2,ch1,ch0} offset binary

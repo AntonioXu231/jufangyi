@@ -123,6 +123,13 @@ void PhaseEllipseWidget::setChannelColor(const QColor &color)
     update();
 }
 
+WidgetPaintMetrics PhaseEllipseWidget::takePaintMetrics()
+{
+    const WidgetPaintMetrics metrics = m_paintMetrics;
+    m_paintMetrics = {};
+    return metrics;
+}
+
 void PhaseEllipseWidget::appendPhaseEvents(const QVector<PdPulse> &events)
 {
     expirePhaseEvents();
@@ -154,22 +161,58 @@ void PhaseEllipseWidget::setEventThreshold(double rawQ88)
     update();
 }
 
+void PhaseEllipseWidget::setWaveformGain(double gain)
+{
+    const double next = qBound(1.0, gain, 12.0);
+    if (qFuzzyCompare(m_waveformGain, next)) return;
+    m_waveformGain = next;
+    update();
+}
+
 void PhaseEllipseWidget::resetZoom()
 {
-    m_zoom = 1.0;
+    setZoomFactor(1.0);
+}
+
+void PhaseEllipseWidget::setZoomFactor(double factor)
+{
+    m_zoom = qBound(0.55, factor, 3.8);
     update();
+}
+
+void PhaseEllipseWidget::zoomIn()
+{
+    setZoomFactor(m_zoom * 1.18);
+}
+
+void PhaseEllipseWidget::zoomOut()
+{
+    setZoomFactor(m_zoom / 1.18);
 }
 
 void PhaseEllipseWidget::wheelEvent(QWheelEvent *event)
 {
-    m_zoom = qBound(0.55, m_zoom *
-                    (event->angleDelta().y() > 0 ? 1.18 : 1.0 / 1.18), 3.8);
-    update();
+    if (event->angleDelta().y() > 0) zoomIn();
+    else zoomOut();
     event->accept();
 }
 
 void PhaseEllipseWidget::paintEvent(QPaintEvent *)
 {
+    QElapsedTimer paintTimer;
+    paintTimer.start();
+    const int retainedEvents = static_cast<int>(m_phaseEvents.size());
+    const auto recordPaintMetrics = [this, &paintTimer, retainedEvents](
+        quint64 sampleVisits, quint64 bucketVisits) {
+        const qint64 elapsedNs = paintTimer.nsecsElapsed();
+        ++m_paintMetrics.paintCount;
+        m_paintMetrics.sampleVisits += sampleVisits;
+        m_paintMetrics.bucketVisits += bucketVisits;
+        m_paintMetrics.totalPaintNs += elapsedNs;
+        m_paintMetrics.maxPaintNs = qMax(m_paintMetrics.maxPaintNs, elapsedNs);
+        m_paintMetrics.maxRetainedEvents =
+            qMax(m_paintMetrics.maxRetainedEvents, retainedEvents);
+    };
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing, true);
     p.fillRect(rect(), QColor(9, 14, 23));
@@ -197,6 +240,7 @@ void PhaseEllipseWidget::paintEvent(QPaintEvent *)
     if (m_samples.isEmpty() && m_envelopeMinimum.isEmpty() && m_phaseEvents.empty()) {
         p.setPen(QColor(185, 215, 230));
         p.drawText(area, Qt::AlignCenter, QStringLiteral("等待相位关联的实时波形帧"));
+        recordPaintMetrics(0U, 0U);
         return;
     }
     if (m_phaseSynchronized && m_fullCycleEnvelope) {
@@ -204,31 +248,34 @@ void PhaseEllipseWidget::paintEvent(QPaintEvent *)
                               m_channelColor.blue(), 125), 1.0));
         for (int i = 0; i < m_envelopeMinimum.size(); ++i) {
             const double phase = 360.0 * i / m_envelopeMinimum.size();
-            const double lowRadius = 1.0 + qBound(-0.24,
-                static_cast<double>(m_envelopeMinimum[i]) / 2048.0 * 0.16, 0.24);
-            const double highRadius = 1.0 + qBound(-0.24,
-                static_cast<double>(m_envelopeMaximum[i]) / 2048.0 * 0.16, 0.24);
             const double angle = phase * kPi / 180.0;
-            const QPointF low(ellipse.center().x() - std::cos(angle) *
-                                  ellipse.width() * 0.5 * lowRadius,
-                              ellipse.center().y() - std::sin(angle) *
-                                  ellipse.height() * 0.5 * lowRadius);
-            const QPointF high(ellipse.center().x() - std::cos(angle) *
-                                   ellipse.width() * 0.5 * highRadius,
-                               ellipse.center().y() - std::sin(angle) *
-                                   ellipse.height() * 0.5 * highRadius);
+            const double x = ellipse.center().x() - std::cos(angle) *
+                             ellipse.width() * 0.5;
+            const double ellipseY = ellipse.center().y() - std::sin(angle) *
+                                    ellipse.height() * 0.5;
+            const double verticalScale =
+                ellipse.height() * 0.75 * m_waveformGain / 2048.0;
+            const double lowY = ellipseY -
+                static_cast<double>(m_envelopeMaximum[i]) * verticalScale;
+            const double highY = ellipseY -
+                static_cast<double>(m_envelopeMinimum[i]) * verticalScale;
+            const QPointF low(x, lowY);
+            const QPointF high(x, highY);
             p.drawLine(low, high);
+            p.drawPoint(low);
+            p.drawPoint(high);
         }
     } else if (m_phaseSynchronized) {
         p.setPen(QPen(m_channelColor.lighter(125), 1.0));
         for (int i = 0; i < m_samples.size(); ++i) {
             const double phase = 2.0 * kPi * i / qMax(1, m_samples.size() - 1);
-            const double radial = 1.0 + qBound(-0.24,
-                static_cast<double>(m_samples[i]) / 2048.0 * 0.16, 0.24);
-            const QPointF point(ellipse.center().x() - std::cos(phase) *
-                                    ellipse.width() * 0.5 * radial,
-                                ellipse.center().y() - std::sin(phase) *
-                                    ellipse.height() * 0.5 * radial);
+            const double x = ellipse.center().x() - std::cos(phase) *
+                             ellipse.width() * 0.5;
+            const double ellipseY = ellipse.center().y() - std::sin(phase) *
+                                    ellipse.height() * 0.5;
+            const double y = ellipseY - static_cast<double>(m_samples[i]) *
+                             (ellipse.height() * 0.75 * m_waveformGain / 2048.0);
+            const QPointF point(x, y);
             p.drawPoint(point);
         }
     }
@@ -265,4 +312,9 @@ void PhaseEllipseWidget::paintEvent(QPaintEvent *)
                QStringLiteral("90°↑  270°↓"));
     p.drawText(area.right() - 115, height() - 6,
                QStringLiteral("180°  %1x").arg(m_zoom, 0, 'f', 2));
+    const quint64 sampleVisits = !m_phaseSynchronized ? 0U
+        : static_cast<quint64>(m_fullCycleEnvelope
+              ? m_envelopeMinimum.size() : m_samples.size());
+    recordPaintMetrics(sampleVisits,
+                       static_cast<quint64>(m_phaseBucketCounts.size()));
 }

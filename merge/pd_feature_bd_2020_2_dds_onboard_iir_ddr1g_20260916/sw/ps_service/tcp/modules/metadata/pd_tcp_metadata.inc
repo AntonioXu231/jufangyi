@@ -1,13 +1,14 @@
 static void reply_status(void)
 {
-    char out[256];
+    char out[320];
     (void)snprintf(out, sizeof(out),
-        "STATUS state=%lu packets=%lu events=%lu snaps=%lu analysis=%lu sweeps=%lu ev_ovw=%lu snap_ovw=%lu recov=%lu disc=%lu ddr=%08lx slot=%08lx dma=%08lx drops=%lu err=%s\r\n",
+        "STATUS state=%lu packets=%lu events=%lu snaps=%lu analysis=%lu sweeps=%lu ev_ovw=%lu snap_ovw=%lu snap_pin_drop=%lu recov=%lu disc=%lu ddr=%08lx slot=%08lx dma=%08lx drops=%lu err=%s\r\n",
         (unsigned long)pd_acq_state(), (unsigned long)pd_acq_packets(),
         (unsigned long)g_pd_acq.event_sequence, (unsigned long)g_pd_acq.snapshot_sequence,
         (unsigned long)pd_analysis_next_sequence(),
         (unsigned long)pd_analysis_sweep_next_sequence(),
         (unsigned long)g_pd_acq.event_overwrites, (unsigned long)g_pd_acq.snapshot_overwrites,
+        (unsigned long)g_pd_acq.snapshot_pin_drops,
         (unsigned long)g_pd_acq.recovery_count,
         (unsigned long)g_pd_acq.recovery_discarded_slots,
         (unsigned long)ddr_read(PD_DDR_STATUS), (unsigned long)ddr_read(PD_SLOT_STATUS),
@@ -25,7 +26,8 @@ static void reply_config(void)
     for (channel = 0U; channel < 4U; ++channel)
         scale[channel] = Xil_In32(PD_FEATURE_BASE + PD_FEATURE_SCALE(channel)) & 0xFFFFU;
     (void)snprintf(out, sizeof(out),
-        "CONFIG api=17 default_limit=%lu event_slots=%u event_stride=%lu snap_slots=%u snap_stride=%lu analysis_slots=%u sweep_slots=%u sweep_windows=%u prpd_bins=%u scope=%lu/%lu scope_fft=ps_q15_1024x1_bins513 snap_fft=ps_q15_1024x1x1_bins513 snap_fft_wave=ps_q15_1024x1_samples_plus_bins scope_env=cycle520000_bins1024_ch4_minmax16 scope_peaks_batch=32 scale_q88=%lu,%lu,%lu,%lu alert_mask=%lx alert_delta=%ld get_max=%u state=%lu\r\n",
+        "CONFIG api=18 sample_hz=%lu default_limit=%lu event_slots=%u event_stride=%lu snap_slots=%u snap_stride=%lu analysis_slots=%u sweep_slots=%u sweep_windows=%u prpd_bins=%u scope=%lu/%lu scope_fft=ps_q15_1024x1_bins513 snap_fft=ps_q15_1024x1x1_bins513 snap_fft_wave=ps_q15_1024x1_samples_plus_bins snap_full=raw6b_1300000 event_meta=per_packet_v1 scope_env=cycle1300000_bins1024_ch4_minmax16 scope_peaks_batch=32 scale_q88=%lu,%lu,%lu,%lu alert_mask=%lx alert_delta=%ld get_max=%u state=%lu\r\n",
+        (unsigned long)PD_SPECTRUM_DEFAULT_FS_HZ,
         (unsigned long)pd_acq_default_packet_limit(), PD_EVENT_ARCHIVE_COUNT,
         (unsigned long)PD_EVENT_ARCHIVE_STRIDE, PD_SNAP_ARCHIVE_COUNT,
         (unsigned long)PD_SNAP_ARCHIVE_STRIDE, PD_ANALYSIS_ARCHIVE_COUNT,
@@ -56,7 +58,7 @@ static void reply_report(void)
     char out[320];
 
     (void)snprintf(out, sizeof(out),
-        "REPORT api=17 state=%lu event_seq=[%lu,%lu) snap_seq=[%lu,%lu) analysis_seq=[%lu,%lu) sweep_seq=[%lu,%lu) alert_mask=0x%lx alert_delta=%ld ddr=%08lx slot=%08lx dma=%08lx drops=%lu err=%s\r\n",
+        "REPORT api=18 state=%lu event_seq=[%lu,%lu) snap_seq=[%lu,%lu) analysis_seq=[%lu,%lu) sweep_seq=[%lu,%lu) alert_mask=0x%lx alert_delta=%ld ddr=%08lx slot=%08lx dma=%08lx drops=%lu err=%s\r\n",
         (unsigned long)pd_acq_state(), (unsigned long)event_first,
         (unsigned long)event_next, (unsigned long)snapshot_first,
         (unsigned long)snapshot_next, (unsigned long)analysis_first,

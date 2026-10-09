@@ -2,7 +2,7 @@
 // Shared per-channel AC/DC phase-window period manager.
 // Counts only valid ADC samples, so its period units match pd_feature_core.
 module pd_period_manager #(
-    parameter integer SAMPLE_HZ    = 26000000,
+    parameter integer SAMPLE_HZ    = 65000000,
     parameter integer DC_WINDOW_US = 20000,
     parameter integer F_MIN_HZ     = 45,
     parameter integer F_MAX_HZ     = 65,

@@ -6,14 +6,14 @@
 #include "pd_snapshot_unpack.h"
 
 #define PD_FFT_POINTS                 1024U
-#define PD_SPECTRUM_DEFAULT_FS_HZ  26000000U
+#define PD_SPECTRUM_DEFAULT_FS_HZ  65000000U
 
 typedef struct {
     u32 dc_code;          /* Mean raw offset-binary ADC code before removal. */
     u32 peak_bin;         /* 1..512; bin zero is deliberately excluded. */
     u32 peak_hz;          /* peak_bin * sample_rate_hz / 1024. */
-    u32 amplitude_code;   /* Hann coherent-gain-corrected approximate peak code. */
-    u64 band_power;       /* Sum of non-DC FFT-bin powers; relative-only, not calibrated. */
+    u32 amplitude_code;   /* Hann-corrected approximate peak ADC code; internal Q8 is removed. */
+    u64 band_power;       /* Non-DC bin-power sum returned at its pre-Q8 relative scale. */
 } pd_spectrum_channel_t;
 
 typedef struct {
@@ -40,7 +40,8 @@ int pd_spectrum_analyze(const void *raw, u32 bytes, u32 start_sample,
 
 /* Analyze one channel and optionally return its 513 single-sided magnitudes.
  * Magnitudes use the same approximate peak-code scale as amplitude_code in
- * pd_spectrum_analyze(); bin 0 is zero because the DC mean is removed. */
+ * pd_spectrum_analyze(); the internal Q8 precision boost is removed on output.
+ * Bin 0 is zero because the DC mean is removed. */
 int pd_spectrum_analyze_channel(const void *raw, u32 bytes, u32 start_sample,
                                 u32 sample_rate_hz, u32 channel,
                                 u16 bins[PD_FFT_POINTS / 2U + 1U],

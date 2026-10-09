@@ -61,13 +61,11 @@ static void start_scope_peaks(void)
         s_scope_peak_buffer[index] = word;
     }
     bytes = record.bytes;
-    for (channel = 0U; channel < 4U; ++channel) {
-        win[channel] = Xil_In32(PD_FEATURE_BASE + PD_FEATURE_CFG0(channel)) >> 16;
-        if (Xil_In32(PD_FEATURE_BASE + PD_FEATURE_STATUS(channel)) & 1U)
-            lock_mask |= 1U << channel;
-    }
+    for (channel = 0U; channel < 4U; ++channel)
+        win[channel] = record.phase_window[channel];
+    lock_mask = record.phase_lock_mask;
     (void)snprintf(out, sizeof(out),
-        "PEAKS V2 seq=%lu total=%lu words=%lu bytes=%lu crc32=%08lx wins=%lu,%lu,%lu,%lu lock=%lx first=%lu next=%lu gap=%lu skipped=%lu\r\n",
+        "PEAKS V4 seq=%lu total=%lu words=%lu bytes=%lu crc32=%08lx wins=%lu,%lu,%lu,%lu lock=%lx first=%lu next=%lu gap=%lu skipped=%lu\r\n",
         (unsigned long)sequence, (unsigned long)peaks,
         (unsigned long)words_count,
         (unsigned long)bytes,
@@ -90,7 +88,7 @@ static void start_scope_peaks_batch(u32 max_packets)
 {
     u32 next, first, sequence, words_count, peaks, payload_bytes = 0U;
     u32 packets = 0U, total_peaks = 0U, gap = 0U, channel, lock_mask = 0U;
-    u32 start_sequence = 0U, index;
+    u32 start_sequence = 0U, index, win[4] = {0U, 0U, 0U, 0U};
     pd_event_record_t record;
     const u64 *words;
     const u8 *raw;
@@ -128,7 +126,7 @@ static void start_scope_peaks_batch(u32 max_packets)
             ++s_scope_peak_skipped;
             continue;
         }
-        if (payload_bytes > PD_SCOPE_PEAK_BATCH_BYTES - 8U - record.bytes)
+        if (payload_bytes > PD_SCOPE_PEAK_BATCH_BYTES - 28U - record.bytes)
             break;
 
         Xil_DCacheInvalidateRange((UINTPTR)record.ddr_addr, record.bytes);
@@ -154,8 +152,16 @@ static void start_scope_peaks_batch(u32 max_packets)
 
         store_u32_le(&s_scope_peak_batch_buffer[payload_bytes], sequence);
         store_u32_le(&s_scope_peak_batch_buffer[payload_bytes + 4U], record.bytes);
-        memcpy(&s_scope_peak_batch_buffer[payload_bytes + 8U], raw, record.bytes);
-        payload_bytes += 8U + record.bytes;
+        store_u32_le(&s_scope_peak_batch_buffer[payload_bytes + 8U],
+                     record.phase_lock_mask);
+        for (channel = 0U; channel < 4U; ++channel) {
+            store_u32_le(&s_scope_peak_batch_buffer[payload_bytes + 12U + channel * 4U],
+                         record.phase_window[channel]);
+            win[channel] = record.phase_window[channel];
+        }
+        lock_mask |= record.phase_lock_mask;
+        memcpy(&s_scope_peak_batch_buffer[payload_bytes + 28U], raw, record.bytes);
+        payload_bytes += 28U + record.bytes;
         total_peaks += peaks;
         ++packets;
         ++s_scope.peak_cursor;
@@ -171,14 +177,8 @@ static void start_scope_peaks_batch(u32 max_packets)
     }
 
     {
-        u32 win[4];
-        for (channel = 0U; channel < 4U; ++channel) {
-            win[channel] = Xil_In32(PD_FEATURE_BASE + PD_FEATURE_CFG0(channel)) >> 16;
-            if (Xil_In32(PD_FEATURE_BASE + PD_FEATURE_STATUS(channel)) & 1U)
-                lock_mask |= 1U << channel;
-        }
         (void)snprintf(out, sizeof(out),
-            "PEAKS V3 packets=%lu peaks=%lu bytes=%lu crc32=%08lx wins=%lu,%lu,%lu,%lu lock=%lx first=%lu next=%lu start=%lu gap=%lu skipped=%lu\r\n",
+            "PEAKS V4 packets=%lu peaks=%lu bytes=%lu crc32=%08lx wins=%lu,%lu,%lu,%lu lock=%lx first=%lu next=%lu start=%lu gap=%lu skipped=%lu\r\n",
             (unsigned long)packets, (unsigned long)total_peaks,
             (unsigned long)payload_bytes,
             (unsigned long)crc32(s_scope_peak_batch_buffer, payload_bytes),

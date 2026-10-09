@@ -36,6 +36,8 @@ static u32 s_last_slot_sequence;
 static u32 s_dma_inflight;
 static u32 s_dma_polls;
 static u32 s_slot_ready_polls;
+static u32 s_snapshot_pinned[PD_SNAP_ARCHIVE_COUNT];
+static u32 s_snapshot_pin_sequence[PD_SNAP_ARCHIVE_COUNT];
 static const char *s_last_error;
 
 static u32 ddr_read(u32 off) { return Xil_In32(PD_DDR_BASE + off); }
@@ -101,6 +103,13 @@ static int archive_event_packet(u32 bytes)
     g_pd_acq.event[index].bytes = bytes;
     g_pd_acq.event[index].peak_words = peaks;
     g_pd_acq.event[index].cycle_words = cycles;
+    g_pd_acq.event[index].phase_lock_mask = 0U;
+    for (i = 0U; i < 4U; ++i) {
+        g_pd_acq.event[index].phase_window[i] =
+            Xil_In32(PD_FEATURE_BASE + PD_FEATURE_CFG0(i)) >> 16;
+        if (Xil_In32(PD_FEATURE_BASE + PD_FEATURE_STATUS(i)) & 1U)
+            g_pd_acq.event[index].phase_lock_mask |= 1U << i;
+    }
     ++g_pd_acq.event_sequence;
     return XST_SUCCESS;
 }
@@ -141,6 +150,16 @@ static int archive_new_snapshot(void)
         return fail("invalid snapshot descriptor");
 
     index = g_pd_acq.snapshot_sequence % PD_SNAP_ARCHIVE_COUNT;
+    if (s_snapshot_pinned[index] != 0U &&
+        s_snapshot_pin_sequence[index] == g_pd_acq.snapshot[index].sequence) {
+        ddr_write(PD_SLOT_CTRL, 1U << (8U + slot));
+        if (ddr_read(PD_SLOT_STATUS) & (1U << (8U + slot)))
+            return fail("pinned snapshot drop could not release PL slot");
+        ddr_write(PD_FREEZE_CTRL, 2U);
+        s_last_slot_sequence = seq;
+        ++g_pd_acq.snapshot_pin_drops;
+        return XST_SUCCESS;
+    }
     dst = PD_SNAP_ARCHIVE_BASE + index * PD_SNAP_ARCHIVE_STRIDE;
     Xil_DCacheInvalidateRange((UINTPTR)base, bytes);
     memcpy((void *)dst, (const void *)(UINTPTR)base, bytes);
@@ -208,15 +227,16 @@ int pd_acq_init(void)
 {
     XAxiDma_Config *cfg;
     memset((void *)&g_pd_acq, 0, sizeof(g_pd_acq));
+    memset(s_snapshot_pinned, 0, sizeof(s_snapshot_pinned));
+    memset(s_snapshot_pin_sequence, 0, sizeof(s_snapshot_pin_sequence));
     g_pd_acq.magic = 0x50444151U; /* PDAQ */
-    g_pd_acq.version = 3U;
+    g_pd_acq.version = PD_ACQ_SHARED_VERSION;
     cfg = XAxiDma_LookupConfig(PD_DMA_LOOKUP_ARG);
     if (cfg == NULL) return fail("DMA config not found");
     if (XAxiDma_CfgInitialize(&s_dma, cfg) != XST_SUCCESS) return fail("DMA init failed");
     if (XAxiDma_HasSg(&s_dma)) return fail("expected Simple-mode DMA");
     XAxiDma_IntrDisable(&s_dma, XAXIDMA_IRQ_ALL_MASK, XAXIDMA_DEVICE_TO_DMA);
-    XAxiDma_Reset(&s_dma);
-    while (!XAxiDma_ResetIsDone(&s_dma)) { }
+    if (reset_dma() != XST_SUCCESS) return XST_FAILURE;
     s_state = PD_ACQ_IDLE;
     return XST_SUCCESS;
 }
@@ -248,8 +268,7 @@ int pd_acq_poll(void)
     if (s_state == PD_ACQ_FAULT) return XST_FAILURE;
     if (s_state == PD_ACQ_STOPPING) {
         if (s_dma_inflight) {
-            XAxiDma_Reset(&s_dma);
-            while (!XAxiDma_ResetIsDone(&s_dma)) { }
+            if (reset_dma() != XST_SUCCESS) return XST_FAILURE;
             s_dma_inflight = 0U;
         }
         return stop_and_drain();
@@ -311,6 +330,28 @@ int pd_acq_get_snapshot_by_sequence(u32 sequence, pd_snapshot_record_t *record)
     return XST_SUCCESS;
 }
 
+int pd_acq_pin_snapshot(u32 sequence)
+{
+    const u32 index = sequence % PD_SNAP_ARCHIVE_COUNT;
+    if (sequence >= g_pd_acq.snapshot_sequence ||
+        g_pd_acq.snapshot[index].sequence != sequence ||
+        g_pd_acq.snapshot[index].archive_addr == 0U ||
+        (s_snapshot_pinned[index] != 0U && s_snapshot_pin_sequence[index] != sequence))
+        return XST_FAILURE;
+    s_snapshot_pin_sequence[index] = sequence;
+    s_snapshot_pinned[index] = 1U;
+    return XST_SUCCESS;
+}
+
+int pd_acq_unpin_snapshot(u32 sequence)
+{
+    const u32 index = sequence % PD_SNAP_ARCHIVE_COUNT;
+    if (s_snapshot_pinned[index] == 0U || s_snapshot_pin_sequence[index] != sequence)
+        return XST_FAILURE;
+    s_snapshot_pinned[index] = 0U;
+    return XST_SUCCESS;
+}
+
 int pd_acq_recover(u32 *discarded_slots)
 {
     u32 i, slot, status, valid;
@@ -367,6 +408,8 @@ void pd_acq_clear_metadata(void)
 {
     if (s_state != PD_ACQ_IDLE) return;
     memset((void *)&g_pd_acq, 0, sizeof(g_pd_acq));
+    memset(s_snapshot_pinned, 0, sizeof(s_snapshot_pinned));
+    memset(s_snapshot_pin_sequence, 0, sizeof(s_snapshot_pin_sequence));
     g_pd_acq.magic = 0x50444151U;
-    g_pd_acq.version = 3U;
+    g_pd_acq.version = PD_ACQ_SHARED_VERSION;
 }

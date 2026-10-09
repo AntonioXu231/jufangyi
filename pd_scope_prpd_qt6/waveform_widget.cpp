@@ -3,6 +3,7 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QDateTime>
+#include <QElapsedTimer>
 #include <QTimer>
 #include <QWheelEvent>
 
@@ -17,21 +18,39 @@ WaveformWidget::WaveformWidget(QWidget *parent) : QWidget(parent)
     connect(refresh, &QTimer::timeout, this, [this] {
         const qint64 now = QDateTime::currentMSecsSinceEpoch();
         constexpr qint64 kPulseHoldMs = 15000;
-        for (int i = m_pulses.size() - 1; i >= 0; --i) {
-            if (now - m_pulses[i].createdMs > kPulseHoldMs)
-                m_pulses.removeAt(i);
-        }
-        if (m_trigger.active && now - m_trigger.createdMs > kPulseHoldMs)
+        bool visualsChanged = expirePulses(now);
+        if (m_trigger.active && now - m_trigger.createdMs > kPulseHoldMs) {
             m_trigger.active = false;
-        update();
+            visualsChanged = true;
+        }
+        if (visualsChanged || !m_pulses.isEmpty() || m_trigger.active) update();
     });
     refresh->start();
+}
+
+bool WaveformWidget::expirePulses(qint64 nowMs)
+{
+    constexpr qint64 kPulseHoldMs = 15000;
+    int expired = 0;
+    while (expired < m_pulses.size() &&
+           nowMs - m_pulses[expired].createdMs > kPulseHoldMs)
+        ++expired;
+    if (expired == 0) return false;
+    m_pulses.remove(0, expired);
+    return true;
 }
 
 void WaveformWidget::setTraceColor(const QColor &color)
 {
     m_traceColor = color;
     update();
+}
+
+WidgetPaintMetrics WaveformWidget::takePaintMetrics()
+{
+    const WidgetPaintMetrics metrics = m_paintMetrics;
+    m_paintMetrics = {};
+    return metrics;
 }
 
 void WaveformWidget::setFrame(const QVector<qint16> &samples, const QVector<PdPulse> &pulses)
@@ -57,7 +76,8 @@ void WaveformWidget::setFrame(const QVector<qint16> &samples, const QVector<PdPu
         positioned.sampleIndex += oldCount;
         m_pulses.append(PulseVisual{positioned, now, false});
     }
-    const int trim = qMax(0, m_samples.size() - maximumHistorySamples);
+    const int trim = m_singleFrameMode
+        ? 0 : qMax(0, m_samples.size() - maximumHistorySamples);
     if (trim > 0) {
         m_samples.remove(0, trim);
         QVector<PulseVisual> retained;
@@ -90,7 +110,8 @@ void WaveformWidget::setFrame(const QVector<qint16> &samples, const QVector<PdPu
     if (m_trigger.active && now - m_trigger.createdMs > kPulseHoldMs)
         m_trigger.active = false;
     if (m_followLatestWindow)
-        m_visibleSamples = qMax(128, qMin(16384, m_samples.size()));
+        m_visibleSamples = m_singleFrameMode
+            ? m_samples.size() : qMax(128, qMin(16384, m_samples.size()));
     else
         m_visibleSamples = qMin(m_visibleSamples, qMax(128, m_samples.size()));
     update();
@@ -108,9 +129,7 @@ void WaveformWidget::setEnvelope(const QVector<qint16> &minimum,
     m_sourceSampleCount = sourceSampleCount;
     m_visibleSamples = m_followLatestWindow ? minimum.size()
                                              : qMin(m_visibleSamples, minimum.size());
-    const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    for (int i = m_pulses.size() - 1; i >= 0; --i)
-        if (now - m_pulses[i].createdMs > 15000) m_pulses.removeAt(i);
+    expirePulses(QDateTime::currentMSecsSinceEpoch());
     update();
 }
 
@@ -166,6 +185,28 @@ void WaveformWidget::wheelEvent(QWheelEvent *event)
 
 void WaveformWidget::paintEvent(QPaintEvent *)
 {
+    struct EventColumn {
+        int count = 0;
+        int positiveCount = 0;
+        int negativeCount = 0;
+        double topY = 0.0;
+        double bottomY = 0.0;
+        double fadeSum = 0.0;
+    };
+    QElapsedTimer paintTimer;
+    paintTimer.start();
+    const int retainedEvents = m_pulses.size();
+    const auto recordPaintMetrics = [this, &paintTimer, retainedEvents](
+        quint64 sampleVisits, quint64 eventVisits) {
+        const qint64 elapsedNs = paintTimer.nsecsElapsed();
+        ++m_paintMetrics.paintCount;
+        m_paintMetrics.sampleVisits += sampleVisits;
+        m_paintMetrics.eventVisits += eventVisits;
+        m_paintMetrics.totalPaintNs += elapsedNs;
+        m_paintMetrics.maxPaintNs = qMax(m_paintMetrics.maxPaintNs, elapsedNs);
+        m_paintMetrics.maxRetainedEvents =
+            qMax(m_paintMetrics.maxRetainedEvents, retainedEvents);
+    };
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing, true);
     p.fillRect(rect(), QColor(8, 15, 25));
@@ -189,6 +230,7 @@ void WaveformWidget::paintEvent(QPaintEvent *)
                    : QStringLiteral("滚轮缩放：%1 点").arg(m_visibleSamples));
     if (m_samples.isEmpty() && m_envelopeMinimum.isEmpty()) {
         p.drawText(area, Qt::AlignCenter, QStringLiteral("等待实时原始波形帧"));
+        recordPaintMetrics(0U, 0U);
         return;
     }
     const int available = m_fullCycleEnvelope ? m_envelopeMinimum.size() : m_samples.size();
@@ -218,11 +260,41 @@ void WaveformWidget::paintEvent(QPaintEvent *)
         p.drawPath(high);
         p.drawPath(low);
     } else {
-        QPainterPath path(map(first, m_samples[first]));
-        for (int i = first + 1; i < m_samples.size(); ++i)
-            path.lineTo(map(i, m_samples[i]));
-        p.setPen(QPen(m_traceColor, 1.1));
-        p.drawPath(path);
+        const int pixelColumns = qMax(1, qRound(area.width()));
+        if (visible <= pixelColumns * 2) {
+            QPainterPath path(map(first, m_samples[first]));
+            for (int i = first + 1; i < first + visible; ++i)
+                path.lineTo(map(i, m_samples[i]));
+            p.setPen(QPen(m_traceColor, 1.1));
+            p.drawPath(path);
+        } else {
+            /* Visit every retained sample, but render each horizontal pixel as
+             * its min/max pair. This preserves narrow transients without
+             * constructing a million-segment path or slowing live capture. */
+            p.setPen(QPen(m_traceColor, 1.0));
+            QPainterPath centers;
+            for (int column = 0; column < pixelColumns; ++column) {
+                const int begin = first + static_cast<int>(
+                    (static_cast<qint64>(column) * visible) / pixelColumns);
+                const int end = first + static_cast<int>(
+                    (static_cast<qint64>(column + 1) * visible) / pixelColumns);
+                if (begin >= end) continue;
+                qint16 low = m_samples[begin];
+                qint16 high = low;
+                for (int sample = begin + 1; sample < end; ++sample) {
+                    low = qMin(low, m_samples[sample]);
+                    high = qMax(high, m_samples[sample]);
+                }
+                const double x = area.left() + column;
+                p.drawLine(QPointF(x, map(begin, high).y()),
+                           QPointF(x, map(begin, low).y()));
+                const double mean = (static_cast<double>(low) + high) * 0.5;
+                if (column == 0) centers.moveTo(x, map(begin, mean).y());
+                else centers.lineTo(x, map(begin, mean).y());
+            }
+            p.setPen(QPen(m_traceColor.lighter(125), 1.0));
+            p.drawPath(centers);
+        }
     }
     if (!m_fullCycleEnvelope && m_trigger.active && m_trigger.endIndex >= first &&
         m_trigger.startIndex < m_samples.size()) {
@@ -238,6 +310,8 @@ void WaveformWidget::paintEvent(QPaintEvent *)
     }
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     constexpr qint64 kPulseHoldMs = 15000;
+    const int eventPixelColumns = qMax(1, qRound(area.width()));
+    QVector<EventColumn> eventColumns(eventPixelColumns);
     for (const auto &visual : m_pulses) {
         const auto &pulse = visual.pulse;
         if (std::abs(pulse.amplitude) < m_eventThreshold) continue;
@@ -250,24 +324,60 @@ void WaveformWidget::paintEvent(QPaintEvent *)
         const QPointF point = m_fullCycleEnvelope
             ? QPointF(map(pulseIndex, 0.0).x(), area.center().y())
             : map(pulseIndex, m_samples[pulseIndex]);
-        const QColor positive = m_traceColor.lighter(140);
-        const QColor negative = m_traceColor.darker(145);
-        const QColor pulseColor = pulse.amplitude < 0.0 ? negative : positive;
-        const int bandAlpha = static_cast<int>(28.0 + 115.0 * fade);
-        p.fillRect(QRectF(point.x() - 5.0, area.top(), 10.0, area.height()),
-                   QColor(pulseColor.red(), pulseColor.green(), pulseColor.blue(), bandAlpha));
-        p.setPen(QPen(QColor(pulseColor.red(), pulseColor.green(), pulseColor.blue(),
-                             static_cast<int>(90 + 165 * fade)),
-                      1.4 + 0.8 * fade));
-        p.drawLine(QPointF(point.x(), area.top()), QPointF(point.x(), area.bottom()));
-        p.setBrush(QColor(pulseColor.red(), pulseColor.green(), pulseColor.blue(),
-                          static_cast<int>(100 + 155 * fade)));
-        p.drawEllipse(point, 5.0 + 3.0 * fade, 5.0 + 3.0 * fade);
-        if (fade > 0.15) {
-            p.setPen(QColor(245, 250, 255, static_cast<int>(120 + 135 * fade)));
-            p.drawText(point + QPointF(8, -8), pulse.phaseValid
-                       ? QStringLiteral("PD %1°").arg(pulse.phaseDeg, 0, 'f', 1)
-                       : QStringLiteral("PD 候选"));
+        const int column = qBound(0,
+            static_cast<int>(point.x() - area.left()), eventPixelColumns - 1);
+        EventColumn &bucket = eventColumns[column];
+        if (bucket.count == 0) {
+            bucket.topY = point.y();
+            bucket.bottomY = point.y();
+        } else {
+            bucket.topY = qMin(bucket.topY, point.y());
+            bucket.bottomY = qMax(bucket.bottomY, point.y());
+        }
+        ++bucket.count;
+        if (pulse.amplitude < 0.0) ++bucket.negativeCount;
+        else ++bucket.positiveCount;
+        bucket.fadeSum += fade;
+    }
+
+    /* Keep every pulse in the 15-second model, but render at screen resolution:
+     * one density marker per pixel column avoids tens of thousands of text and
+     * painter operations while retaining pile-up count and amplitude spread. */
+    int annotationBudget = 8;
+    int lastAnnotationColumn = -72;
+    for (int column = 0; column < eventColumns.size(); ++column) {
+        const EventColumn &bucket = eventColumns[column];
+        if (bucket.count == 0) continue;
+        QColor pulseColor = m_traceColor;
+        if (bucket.positiveCount > bucket.negativeCount)
+            pulseColor = pulseColor.lighter(140);
+        else if (bucket.negativeCount > bucket.positiveCount)
+            pulseColor = pulseColor.darker(145);
+        const double logCount = std::log2(static_cast<double>(bucket.count) + 1.0);
+        const double averageFade = bucket.fadeSum / bucket.count;
+        const int alpha = qBound(28, static_cast<int>(
+            (72.0 + 34.0 * logCount) * (0.35 + 0.65 * averageFade)), 235);
+        pulseColor.setAlpha(alpha);
+        const double x = area.left() + column + 0.5;
+        const double y = (bucket.topY + bucket.bottomY) * 0.5;
+        p.setPen(QPen(pulseColor, qMin(4.0, 1.1 + 0.45 * logCount),
+                      Qt::SolidLine, Qt::RoundCap));
+        if (bucket.bottomY - bucket.topY > 1.0)
+            p.drawLine(QPointF(x, bucket.topY), QPointF(x, bucket.bottomY));
+        else
+            p.drawLine(QPointF(x, y - 3.0), QPointF(x, y + 3.0));
+        p.setBrush(pulseColor);
+        p.drawEllipse(QPointF(x, y), qMin(5.0, 1.6 + 0.45 * logCount),
+                      qMin(5.0, 1.6 + 0.45 * logCount));
+        if (bucket.count > 1 && annotationBudget > 0 &&
+            column - lastAnnotationColumn >= 72) {
+            p.setPen(QColor(245, 250, 255, 220));
+            p.drawText(QPointF(x + 5.0, y - 5.0),
+                       QStringLiteral("×%1").arg(bucket.count));
+            lastAnnotationColumn = column;
+            --annotationBudget;
         }
     }
+    recordPaintMetrics(static_cast<quint64>(visible),
+                       static_cast<quint64>(retainedEvents));
 }

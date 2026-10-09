@@ -74,6 +74,16 @@ void ChannelPanel::resetZoom()
     m_ellipse->resetZoom();
 }
 
+WidgetPaintMetrics ChannelPanel::takeWaveformPaintMetrics()
+{
+    return m_waveform->takePaintMetrics();
+}
+
+WidgetPaintMetrics ChannelPanel::takePhasePaintMetrics()
+{
+    return m_ellipse->takePaintMetrics();
+}
+
 void ChannelPanel::appendPhaseEvents(const QVector<PdPulse> &events)
 {
     m_waveform->appendPhaseEvents(events);

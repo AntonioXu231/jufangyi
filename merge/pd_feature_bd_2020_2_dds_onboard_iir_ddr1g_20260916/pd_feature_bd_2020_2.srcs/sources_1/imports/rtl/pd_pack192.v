@@ -14,7 +14,7 @@
 // 时序（tready 常高、数据常有时）：每 5 个时钟完成 1 个块（4 字入 / 3 beat 出）
 //     c5:in W0 | c6:in W1 | c7:out b0 + in W2 | c8:out b1 + in W3 | c9:out b2
 //   65MSPS 时 130MHz 域需 2 clk/样本 = 8 clk/块，5 < 8，余量充足；
-//   26MSPS(测试) 时 20 clk/块，更宽松。
+//   65MSPS 最终档时 8 clk/块，超过 5 clk/块的打包器吞吐需求。
 //
 // 背压：m_axis_tready 拉低时停止发 beat，wcnt 饱和在 4 并使 s48_ready=0，
 //       反压逐级传到上游异步 FIFO，绝不丢样本（契约"原始无损"要求）。

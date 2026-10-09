@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+### 2026-10-09 · v1.9.1 当前进度备份（backup branch，非发布）
+
+- 在 `backup-v1.9.1-current-state-20261009` 分支保存当前主 PL/PS 工程、Qt6 上位机源码、65 MSPS ROM/DDS 输入和项目核查报告；不合并到 `main`、不创建版本标签。
+- 备份保留当前存在的复现输入（XCI/MIF、MATLAB 仿真模型及数据、XSA）；排除 Vivado IP 自动生成的 vendor HDL、Qt build/.qtcreator、本地 Codex 临时文件和其他历史工程副本。
+- 当前最新单通道相位页/波形偏差增益修改为源码状态，未由本机执行 Qt 构建；Vitis app10 工作区 `F:\ps\lwip_echo_server10` 在仓库之外，不纳入本次 Git 快照。
+- 详细范围、验证边界和回退方式见 `变更记录/v1.9.1-current-state-backup-20261009.md`。
+
 ### 2026-10-04 · v1.9.1 本地预审优化（非发布）
 
 - 预审优化：PS `CONFIG` 只读回报 PL 四通道 SCALE，Qt 在四路一致时自动同步；Qt 事件幅值按 SCALE 折回 AD 码；事件读取改为最旧序号优先、连续游标、失败重试和覆盖缺口计数；事件包分段下载支持完整 64 KiB 记录；`SCOPE EVENT` 可指定记录/通道/事件字序号；新增单通道实时波形 + PS FFT 页、50 ms 合并绘图、15 秒到达时间窗口和 1,000,000 点/通道上限。

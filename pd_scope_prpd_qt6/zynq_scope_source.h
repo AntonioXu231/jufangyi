@@ -2,6 +2,7 @@
 
 #include "scope_types.h"
 
+#include <QByteArray>
 #include <QObject>
 
 class QTcpSocket;
@@ -21,6 +22,7 @@ public:
     void setFftChannel(int channel);
     void requestSnapshotCatalog();
     void requestSnapshotFft(quint32 sequence, int channel, quint32 startSample);
+    void requestFullSnapshotFft(quint32 sequence, int channel, quint32 startSample);
     void shutdown();
 
 signals:
@@ -48,9 +50,15 @@ private slots:
     void flushEventBatch();
 
 private:
-    enum class BinaryKind { None, Scope, Envelope, Peaks, PeakBatch, Spectrum, SnapshotSpectrum };
-    enum class RequestKind { None, Frame, Envelope, Peaks, Spectrum, Catalog, SnapshotSpectrum };
-    enum class ArchiveFftPhase { None, DisableScope, Stop, WaitIdle, Status, Catalog, Transfer };
+    enum class BinaryKind {
+        None, Scope, Envelope, Peaks, PeakBatch, Spectrum, SnapshotSpectrum, SnapshotChunk
+    };
+    enum class RequestKind {
+        None, Frame, Envelope, Peaks, Spectrum, Catalog, SnapshotSpectrum, SnapshotChunk
+    };
+    enum class ArchiveFftPhase {
+        None, DisableScope, Stop, WaitIdle, Status, Catalog, SnapshotRead, Transfer
+    };
 
     void sendLine(const QString &line);
     void processLines();
@@ -59,6 +67,8 @@ private:
     void requestNextEnvelope();
     void requestNextPeaks();
     void requestScopeSpectrum();
+    void requestNextSnapshotChunk();
+    void requestArchiveSpectrum();
     void finishRequest(bool emptyPeaks = false);
     void schedulePump(int delayMs = 0);
     void finishDisconnect();
@@ -127,7 +137,6 @@ private:
     bool m_frameDue = false;
     bool m_envelopeDue = false;
     bool m_forcePeaksAfterEnvelope = false;
-    quint32 m_peaksSinceEnvelope = 0;
     bool m_nextNormalIsFrame = true;
     bool m_manualPeaksPending = false;
     bool m_spectrumPending = false;
@@ -137,12 +146,18 @@ private:
     bool m_disconnectRequested = false;
     bool m_catalogPending = false;
     bool m_snapshotFftPending = false;
+    bool m_snapshotFullPending = false;
+    bool m_downloadFullSnapshot = false;
     bool m_resumeAfterSnapshotFft = false;
     ArchiveFftPhase m_archiveFftPhase = ArchiveFftPhase::None;
     quint32 m_snapshotFftSequence = 0;
     quint32 m_snapshotFftChannel = 0;
     quint32 m_snapshotFftStart = 0;
+    quint32 m_snapshotReadOffset = 0;
+    quint32 m_fullSnapshotSequence = 0xFFFFFFFFU;
     quint32 m_archiveFftPollCount = 0;
     qint64 m_requestStartedAtMs = 0;
+    QByteArray m_snapshotRawBuffer;
+    QVector<QVector<qint16>> m_fullSnapshotChannels;
     ScopeArchiveSpectrum m_archiveSpectrum;
 };

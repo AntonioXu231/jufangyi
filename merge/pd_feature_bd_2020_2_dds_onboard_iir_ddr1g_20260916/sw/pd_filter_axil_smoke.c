@@ -53,7 +53,7 @@ int main(void)
         xil_printf("FAIL: unexpected filter version.\r\n");
         return XST_FAILURE;
     }
-    if (sample_hz != 26000000U) {
+    if (sample_hz != 65000000U) {
         xil_printf("FAIL: unexpected sample rate.\r\n");
         return XST_FAILURE;
     }
